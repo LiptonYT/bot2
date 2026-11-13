@@ -167,7 +167,19 @@ def blacklist_days(value):
     raise ValueError("Укажите срок от 1 до 3650 дней или «бессрочно».")
 
 
-def plan_roles(config, current, action, destination, department=None, *, managed_roles=()):
+def family_role_id(config, guild_roles):
+    configured = config.extra_roles.get("Сотрудник семьи")
+    if configured is not None:
+        return configured
+    ids = [role.id for role in guild_roles
+           if role.name == "Сотрудник семьи" and not role.managed and not role.is_default()]
+    reserved = {config.chief, config.founder, config.senior, *config.ranks.values(),
+                *config.statuses.values(), *config.extra_roles.values()}
+    reserved.update(role_id for bundle in config.departments.values() for role_id in bundle)
+    return ids[0] if len(ids) == 1 and ids[0] not in reserved else None
+
+
+def plan_roles(config, current, action, destination, department=None, *, managed_roles=(), base_role=None):
     if config.statuses["Чёрный список"] in current and action in ("promote", "demote", "transfer", "grant"):
         raise ValueError("Сначала вынесите участника из чёрного списка.")
     ranks = list(config.ranks.values())
@@ -205,9 +217,17 @@ def plan_roles(config, current, action, destination, department=None, *, managed
             if status not in current:
                 raise ValueError("Участник не в чёрном списке.")
             return current - {status}
-        if action == "dismiss" and config.statuses["Чёрный список"] in current:
-            raise ValueError("Участник в чёрном списке. Сначала вынесите его из списка.")
-        return (current & set(managed_roles)) | {status}
+        remaining = (current & set(managed_roles)) | {status}
+        if action == "dismiss":
+            if config.statuses["Чёрный список"] in current:
+                raise ValueError("Участник в чёрном списке. Сначала вынесите его из списка.")
+            base_role = config.extra_roles.get("Сотрудник семьи", base_role)
+            if base_role is None:
+                raise ValueError("Укажите ID базовой роли «Сотрудник семьи» в extra_roles в config.json.")
+            if base_role not in current:
+                raise ValueError("У участника нет роли «Сотрудник семьи». Он уже считается уволенным.")
+            remaining.discard(base_role)
+        return remaining
     raise ValueError("Неизвестная операция.")
 
 
@@ -462,7 +482,8 @@ class AuditClient(discord.Client):
                 current = {r.id for r in target.roles if not r.is_default()}
                 require_authorization(conf, {r.id for r in actor.roles}, current, action, destination)
                 new = plan_roles(conf, current, action, destination, department,
-                                 managed_roles={r.id for r in target.roles if r.managed})
+                                 managed_roles={r.id for r in target.roles if r.managed},
+                                 base_role=family_role_id(conf, guild.roles) if action == "dismiss" else None)
                 new_nick = None
                 old_display_name = target.display_name
                 if action == "grant":
