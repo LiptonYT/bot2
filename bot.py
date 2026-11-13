@@ -179,6 +179,17 @@ def family_role_id(config, guild_roles):
     return ids[0] if len(ids) == 1 and ids[0] not in reserved else None
 
 
+def require_dismissible(config, current, base_role=None):
+    if config.statuses["Чёрный список"] in current:
+        raise ValueError("Участник в чёрном списке. Сначала вынесите его из списка.")
+    base_role = config.extra_roles.get("Сотрудник семьи", base_role)
+    if base_role is None:
+        raise ValueError("Укажите ID базовой роли «Сотрудник семьи» в extra_roles в config.json.")
+    if base_role not in current:
+        raise ValueError("У участника нет роли «Сотрудник семьи». Он уже считается уволенным.")
+    return base_role
+
+
 def plan_roles(config, current, action, destination, department=None, *, managed_roles=(), base_role=None):
     if config.statuses["Чёрный список"] in current and action in ("promote", "demote", "transfer", "grant"):
         raise ValueError("Сначала вынесите участника из чёрного списка.")
@@ -219,14 +230,7 @@ def plan_roles(config, current, action, destination, department=None, *, managed
             return current - {status}
         remaining = (current & set(managed_roles)) | {status}
         if action == "dismiss":
-            if config.statuses["Чёрный список"] in current:
-                raise ValueError("Участник в чёрном списке. Сначала вынесите его из списка.")
-            base_role = config.extra_roles.get("Сотрудник семьи", base_role)
-            if base_role is None:
-                raise ValueError("Укажите ID базовой роли «Сотрудник семьи» в extra_roles в config.json.")
-            if base_role not in current:
-                raise ValueError("У участника нет роли «Сотрудник семьи». Он уже считается уволенным.")
-            remaining.discard(base_role)
+            remaining.discard(require_dismissible(config, current, base_role))
         return remaining
     raise ValueError("Неизвестная операция.")
 
@@ -650,6 +654,15 @@ class MemberStep(StaffView):
     @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Выберите участника")
     async def member(self, interaction, menu):
         member = menu.values[0]
+        if self.action == "dismiss":
+            if not isinstance(member, discord.Member) or interaction.guild is None:
+                return await reply(interaction, "Выберите участника этого сервера.")
+            config = self.bot.config
+            try:
+                require_dismissible(config, {role.id for role in member.roles},
+                                    family_role_id(config, interaction.guild.roles))
+            except ValueError as exc:
+                return await reply(interaction, str(exc))
         if self.action == "blacklist":
             return await interaction.response.send_modal(BlacklistForm(self.bot, member.id))
         if self.action in STATUS_ACTIONS:
