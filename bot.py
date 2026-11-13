@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -28,6 +29,21 @@ ACTIONS = {
 
 
 STATUS_ACTIONS = {"dismiss": "Уволен", "blacklist": "Чёрный список", "unblacklist": "Чёрный список"}
+BLACKLIST_TITLES = {
+    "blacklist": "⛔ Занесён в чёрный список",
+    "unblacklist": "✅ Вынесен из чёрного списка",
+}
+
+
+def blacklist_log_channel_id(config):
+    channel_id = config.blacklist_channel
+    if not channel_id or channel_id in (config.journal, config.panel):
+        raise ValueError("Укажите отдельный канал для ЧС в blacklist_channel_id, не канал аудита или панели.")
+    return channel_id
+
+
+def action_log_channel_id(config, action):
+    return blacklist_log_channel_id(config) if action in BLACKLIST_TITLES else config.journal
 
 
 def snowflake(value):
@@ -191,10 +207,7 @@ def plan_roles(config, current, action, destination, department=None, *, managed
             return current - {status}
         if action == "dismiss" and config.statuses["Чёрный список"] in current:
             raise ValueError("Участник в чёрном списке. Сначала вынесите его из списка.")
-        new = (current & set(managed_roles)) | {status}
-        if new == current:
-            raise ValueError("Этот статус уже установлен, других снимаемых ролей нет.")
-        return new
+        return (current & set(managed_roles)) | {status}
     raise ValueError("Неизвестная операция.")
 
 
@@ -222,6 +235,31 @@ def suggested_name(config, label):
     managed = {"Начальник", "Зам. начальника", "Зам. нач.", "Сотрудник"} | set(config.extra_roles)
     tags = {department_tag(config, unit) for unit in config.departments}
     return name if separator and prefix in {f"{p} {t}" for p in managed for t in tags} else label
+
+
+STATUS_NICK_PREFIX = re.compile(r"^(?:\[(?:ЧС\s*\+\s*УВОЛЕН|ЧС|УВОЛЕН)\]\s*|"
+                                r"(?:ЧС\s*\+\s*УВОЛЕН|ЧС|УВОЛЕН)\s*\|\s*)",
+                                re.IGNORECASE)
+
+
+def status_nick(config, action, label, fallback):
+    base = label.strip()
+    tags = {department_tag(config, unit).casefold() for unit in config.departments}
+    bracket_positions = {"стажёр", "стажер", "сотрудник", "начальник",
+                         "зам. нач.", "зам. начальника"}
+    while base:
+        cleaned = suggested_name(config, STATUS_NICK_PREFIX.sub("", base, count=1)).strip()
+        tag, separator, rest = cleaned.partition("]")
+        if separator and tag.startswith("["):
+            position, _, unit = tag[1:].casefold().strip().rpartition(" ")
+            if unit in tags and position in bracket_positions:
+                cleaned = rest.strip()
+        if cleaned == base:
+            break
+        base = cleaned
+    base = base or fallback.strip()
+    prefix = "[ЧС + УВОЛЕН] " if action == "blacklist" else "[УВОЛЕН] "
+    return (prefix + base)[:32].rstrip()
 
 
 def embed(title, description=None):
@@ -320,20 +358,30 @@ class AuditClient(discord.Client):
             return
         try:
             member = await guild.fetch_member(member_id)
-            if role in member.roles:
+            had_blacklist = role in member.roles
+            if had_blacklist:
                 await member.remove_roles(role, reason="Истёк срок чёрного списка")
         except discord.NotFound:
             pass
         except discord.HTTPException:
             logging.warning("Не удалось снять истёкший ЧС у %s, повторим позже", member_id)
             return
+        else:
+            if had_blacklist:
+                new_nick = status_nick(conf, "unblacklist", member.display_name, member.name)
+                try:
+                    if new_nick != member.nick:
+                        await member.edit(nick=new_nick, reason="Истёк срок чёрного списка")
+                except discord.HTTPException:
+                    logging.warning("ЧС снят, но не удалось изменить никнейм участника %s", member_id)
         with sqlite3.connect(conf.database) as db:
             db.execute("DELETE FROM blacklist_expiry WHERE member=?", (member_id,))
         if conf.blacklist_channel:
             try:
-                card = embed("✅ Срок чёрного списка истёк")
+                card = embed(BLACKLIST_TITLES["unblacklist"])
                 card.add_field(name="Участник", value=f"<@{member_id}> · `{member_id}`")
-                await self.channel(guild, conf.blacklist_channel).send(embed=card)
+                card.add_field(name="Причина", value="Срок чёрного списка истёк.", inline=False)
+                await self.channel(guild, blacklist_log_channel_id(conf)).send(embed=card)
             except (ValueError, discord.HTTPException):
                 logging.warning("Не удалось опубликовать окончание ЧС у %s", member_id)
 
@@ -398,13 +446,10 @@ class AuditClient(discord.Client):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         conf = self.config
+        is_blacklist_action = action in BLACKLIST_TITLES
         async with self.lock:
             try:
-                channel = self.channel(guild, conf.journal)
-                if action == "blacklist" and not conf.blacklist_channel:
-                    raise ValueError("Добавьте ID специального канала в blacklist_channel_id в config.json.")
-                blacklist_channel = self.channel(guild, conf.blacklist_channel) if (
-                    conf.blacklist_channel and action in ("blacklist", "unblacklist")) else None
+                channel = self.channel(guild, action_log_channel_id(conf, action))
                 expires = int(time.time()) + days * 86400 if action == "blacklist" and days is not None else None
                 target = await guild.fetch_member(member_id)
                 actor = await guild.fetch_member(interaction.user.id)
@@ -419,12 +464,21 @@ class AuditClient(discord.Client):
                 new = plan_roles(conf, current, action, destination, department,
                                  managed_roles={r.id for r in target.roles if r.managed})
                 new_nick = None
+                old_display_name = target.display_name
                 if action == "grant":
                     if not guild.me.guild_permissions.manage_nicknames:
                         raise ValueError("Боту не хватает права «Управлять никнеймами».")
                     new_nick = appointment_nick(conf, destination, department, name or "")
                     if new == current and new_nick == target.nick:
                         raise ValueError("Участник уже на этой должности, никнейм совпадает.")
+                elif action in STATUS_ACTIONS:
+                    candidate = status_nick(conf, action, old_display_name, target.name)
+                    if candidate != target.nick:
+                        if not guild.me.guild_permissions.manage_nicknames:
+                            raise ValueError("Боту не хватает права «Управлять никнеймами» для изменения статуса.")
+                        new_nick = candidate
+                    elif new == current:
+                        raise ValueError("Этот статус уже установлен, никнейм совпадает.")
                 changed = [guild.get_role(rid) for rid in current ^ new]
                 if any(r is None or not r.is_assignable()
                        or (actor.id != guild.owner_id and r >= actor.top_role) for r in changed):
@@ -445,7 +499,7 @@ class AuditClient(discord.Client):
                 return ", ".join(r.name for r in roles)[:1024] or "—"
 
             mark, label = ACTIONS[action]
-            card = embed(f"{mark} {label.upper()}")
+            card = embed(BLACKLIST_TITLES.get(action, f"{mark} {label.upper()}"))
             card.add_field(name="Участник", value=f"{target.mention}\nID: `{target.id}`")
             card.add_field(name="Кадровик", value=f"{actor.mention}\n{discord.utils.escape_markdown(actor.display_name)}")
             fields = {
@@ -469,7 +523,9 @@ class AuditClient(discord.Client):
             if action == "grant":
                 card.add_field(name="Отдел", value=department, inline=False)
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
-                card.add_field(name="Никнейм", value=f"{target.display_name} → {new_nick}", inline=False)
+            if new_nick is not None:
+                card.add_field(name="Никнейм", value=f"{discord.utils.escape_markdown(old_display_name)} → "
+                               f"{discord.utils.escape_markdown(new_nick)}", inline=False)
             card.add_field(name="Причина", value=reason, inline=False)
             if action == "blacklist":
                 term = f"{days} дн. · до <t:{expires}:f>" if expires else "Бессрочно"
@@ -507,22 +563,15 @@ class AuditClient(discord.Client):
                         db.execute("UPDATE journal SET discord_message=? WHERE id=?", (log.id, record))
                 except sqlite3.Error:
                     logging.exception("Не сохранён ID сообщения аудита")
-            blacklist_sent = not blacklist_channel or (blacklist_channel.id == channel.id and log is not None)
-            if blacklist_channel and not blacklist_sent:
-                try:
-                    await blacklist_channel.send(embed=card)
-                    blacklist_sent = True
-                except discord.HTTPException:
-                    logging.exception("Не удалось отправить запись в канал ЧС")
             dm_sent = await send_personal_notice(target, actor, card, action, record)
             if log:
-                result = f"✅ Готово. [Запись в журнале]({log.jump_url})"
+                label = "Запись в канале ЧС" if is_blacklist_action else "Запись в журнале"
+                result = f"✅ Готово. [{label}]({log.jump_url})"
             else:
                 backup = f" Запись №{record} сохранена в базе." if record else " Сохранить запись в базе также не удалось."
-                result = "⚠️ Действие выполнено, но запись в канал аудита не отправилась." + backup
+                label = "канал ЧС" if is_blacklist_action else "канал аудита"
+                result = f"⚠️ Действие выполнено, но запись в {label} не отправилась." + backup
             result += "\n📩 Личное сообщение отправлено." if dm_sent else "\n⚠️ Не удалось отправить ЛС участнику."
-            if not blacklist_sent:
-                result += "\n⚠️ Запись в специальный канал ЧС не отправилась."
             if not expiry_saved:
                 result += "\n⚠️ Срок ЧС не сохранён. Проверьте базу и снимите ЧС вручную при необходимости."
             await reply(interaction, result)
