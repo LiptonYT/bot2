@@ -1,5 +1,6 @@
 import asyncio
 from copy import deepcopy
+from collections import Counter
 import json
 import logging
 import os
@@ -36,7 +37,24 @@ def department_role_ids(value):
     values = value if isinstance(value, list) else [value]
     if not values:
         raise ValueError("У каждого отдела должна быть хотя бы одна роль Discord.")
-    return tuple(snowflake(role) for role in values)
+    roles = tuple(snowflake(role) for role in values)
+    if len(roles) != len(set(roles)):
+        raise ValueError("Не повторяйте один ID внутри списка одного отдела.")
+    return roles
+
+
+def shared_department_roles(departments):
+    counts = Counter(role for bundle in departments.values() for role in bundle)
+    return {role for role, count in counts.items() if count > 1}
+
+
+def member_department(config, current):
+    shared = shared_department_roles(config.departments)
+    markers = current - shared
+    units = [unit for unit, bundle in config.departments.items() if markers.intersection(bundle)]
+    if len(units) != 1:
+        raise ValueError("Для перевода у участника должна быть уникальная роль ровно одного отдела.")
+    return units[0]
 
 
 @dataclass(frozen=True)
@@ -77,7 +95,12 @@ class Config:
         if list(groups[0])[-1] != PROTECTED_RANK:
             raise ValueError(f"Последним в ranks укажите «{PROTECTED_RANK}».")
         ids = [role for index, group in enumerate(groups) if index != 1 for role in group.values()]
-        ids.extend(role for bundle in groups[1].values() for role in bundle)
+        department_roles = {role for bundle in groups[1].values() for role in bundle}
+        shared = shared_department_roles(groups[1])
+        for name, bundle in groups[1].items():
+            if not set(bundle) - shared:
+                raise ValueError(f"У отдела «{name}» должна быть хотя бы одна уникальная роль.")
+        ids.extend(department_roles)
         if len(ids) != len(set(ids)) or guild in ids or {senior, chief, founder} & set(ids) or len({guild, senior, chief}) != 3:
             raise ValueError("ID ролей званий, отделов, статусов, Начальника семьи и старшего состава должны различаться.")
         if panel == journal:
@@ -113,6 +136,8 @@ def plan_roles(config, current, action, destination, department=None):
     ranks = list(config.ranks.values())
     departments = {role for bundle in config.departments.values() for role in bundle}
     statuses = set(config.statuses.values())
+    shared = shared_department_roles(config.departments)
+    unique_department_roles = departments - shared
     active_ranks = current & set(ranks)
     active_departments = current & departments
     if action in ("promote", "demote"):
@@ -126,12 +151,10 @@ def plan_roles(config, current, action, destination, department=None):
             raise ValueError("Новое звание должно соответствовать направлению операции.")
         return (current - active_ranks) | {destination}
     if action == "transfer":
-        old_units = [unit for unit, bundle in config.departments.items() if active_departments.intersection(bundle)]
-        if len(old_units) != 1:
-            raise ValueError("Для перевода у участника должен быть ровно один настроенный отдел.")
-        if destination not in config.departments or destination == old_units[0]:
+        old_unit = member_department(config, current)
+        if destination not in config.departments or destination == old_unit:
             raise ValueError("Выберите другой настроенный отдел.")
-        return (current - departments) | set(config.departments[destination])
+        return (current - unique_department_roles) | (set(config.departments[destination]) - shared)
     if action == "grant":
         if destination not in config.extra_roles.values():
             raise ValueError("Эта дополнительная роль не настроена.")
@@ -139,7 +162,8 @@ def plan_roles(config, current, action, destination, department=None):
             raise ValueError("Выберите настроенный отдел.")
         position_roles = {role for name, role in config.extra_roles.items() if name != "Сотрудник семьи"}
         old_positions = position_roles if destination in position_roles else set()
-        return (current - departments - old_positions) | set(config.departments[department]) | {destination}
+        return ((current - unique_department_roles - old_positions)
+                | (set(config.departments[department]) - shared) | {destination})
     if action == "dismiss":
         if destination not in statuses:
             raise ValueError("Этот статус увольнения не настроен.")
@@ -355,7 +379,7 @@ class AuditClient(discord.Client):
             card.add_field(name=updated, value=guild.get_role(destination).name
                            if action in ("grant", "dismiss") else names(after), inline=False)
             if action == "transfer":
-                old_unit = next(unit for unit, bundle in conf.departments.items() if current.intersection(bundle))
+                old_unit = member_department(conf, current)
                 card.add_field(name="Перевод", value=f"{old_unit} → {destination}", inline=False)
             if action == "grant":
                 card.add_field(name="Отдел", value=department, inline=False)
@@ -523,7 +547,7 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("Укажите BOT_TOKEN в настройках хостинга.")
     try:
-        cfg = Config.load(os.getenv("KADRO_CONFIG", "config.json"))
+        cfg = Config.load(os.getenv("KADRO_CONFIG") or Path(__file__).resolve().with_name("config.json"))
     except (OSError, KeyError, TypeError, ValueError) as error:
         raise SystemExit(f"Заполните config.json по образцу. {error}") from error
     AuditClient(cfg).run(token)
