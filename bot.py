@@ -301,7 +301,7 @@ class AuditClient(discord.Client):
                             raise ValueError(f"Роль «{name}» (ID {role_id}) не найдена или недоступна боту.")
             message = await panel.send(embed=embed(
                 f"{BRAND} | КАДРОВЫЙ АУДИТ",
-                "Выберите кадровое действие в выпадающем списке.\n\n"
+                "Нажмите **«Подать аудит»**, чтобы открыть личное меню кадровых действий.\n\n"
                 "📈 **Повышение** и 📉 **Понижение** меняют звание, сохраняя отдел.\n"
                 "🔄 **Перевод** меняет отдел, сохраняя звание.\n"
                 "🚪 **Увольнение** снимает кадровые роли и выдаёт выбранный статус.\n\n"
@@ -433,17 +433,31 @@ class StaffView(discord.ui.View):
 class MainPanel(StaffView):
     def __init__(self, bot):
         super().__init__(bot, timeout=None)
+
+    @discord.ui.button(label="Подать аудит", emoji="📋", style=discord.ButtonStyle.danger,
+                       custom_id="pgo:kadro:submit_audit")
+    async def open_audit(self, interaction, button):
+        await interaction.response.send_message(
+            "**📋 Подача кадрового аудита**\nВыберите действие из списка.",
+            view=ActionMenu(self.bot, interaction), ephemeral=True)
+
+
+class ActionMenu(StaffView):
+    def __init__(self, bot, interaction):
+        super().__init__(bot)
         menu = discord.ui.Select(
-            custom_id="pgo:kadro:action_menu", placeholder="Выберите кадровое действие",
+            placeholder="Выберите кадровое действие",
             options=[discord.SelectOption(label=label, value=action, emoji=emoji)
-                     for action, (emoji, label) in ACTIONS.items()])
+                     for action, (emoji, label) in ACTIONS.items()
+                     if bot.can_review(interaction, action)])
+
         async def callback(interaction):
             action = menu.values[0]
             if not bot.can_review(interaction, action):
                 return await reply(interaction, "У вас нет доступа к этому действию.")
-            await interaction.response.send_message(
-                f"**{ACTIONS[action][1]}** · выберите участника.",
-                view=MemberStep(bot, action), ephemeral=True)
+            await interaction.response.edit_message(
+                content=f"**{ACTIONS[action][1]}** · выберите участника.",
+                view=MemberStep(bot, action))
         menu.callback = callback
         self.add_item(menu)
 
