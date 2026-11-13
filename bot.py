@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,9 +20,14 @@ ACTIONS = {
     "promote": ("📈", "Повышение"),
     "demote": ("📉", "Понижение"),
     "transfer": ("🔄", "Перевод"),
-    "dismiss": ("🚪", "Увольнение"),
+    "dismiss": ("🚪", "Уволить"),
+    "blacklist": ("⛔", "Занести в чёрный список"),
+    "unblacklist": ("✅", "Вынести из чёрного списка"),
     "grant": ("🎖️", "Назначить на должность"),
 }
+
+
+STATUS_ACTIONS = {"dismiss": "Уволен", "blacklist": "Чёрный список", "unblacklist": "Чёрный список"}
 
 
 def snowflake(value):
@@ -71,6 +77,7 @@ class Config:
     extra_roles: dict
     department_tags: dict
     database: str
+    blacklist_channel: int | None = None
 
     @classmethod
     def load(cls, path):
@@ -86,6 +93,8 @@ class Config:
                 groups.append({name: department_role_ids(value) for name, value in source.items()})
             else:
                 groups.append({name: snowflake(role) for name, role in source.items()})
+        if not set(STATUS_ACTIONS.values()) <= groups[2].keys():
+            raise ValueError("В dismissal_statuses нужны роли «Уволен» и «Чёрный список».")
         guild, panel, journal, senior = (snowflake(raw[k]) for k in (
             "guild_id", "panel_channel_id", "audit_channel_id", "senior_role_id"))
         chief = snowflake(raw["family_chief_role_id"])
@@ -110,7 +119,8 @@ class Config:
                                              or not tag.replace(" ", "").isalnum() for tag in tags.values()):
             raise ValueError("В department_tags укажите короткие обозначения отделов без знаков.")
         return cls(guild, panel, journal, senior, chief, founder, *groups, tags,
-                   os.getenv("KADRO_DB", "karateli_kadro.sqlite3"))
+                   os.getenv("KADRO_DB", "karateli_kadro.sqlite3"),
+                   snowflake(raw["blacklist_channel_id"]) if raw.get("blacklist_channel_id") else None)
 
 
 def can_grant_extra(config, actor_roles):
@@ -127,19 +137,28 @@ def require_authorization(config, actor_roles, current, action, destination):
     protected = config.ranks[PROTECTED_RANK]
     if config.chief not in actor_roles and (
         (action in ("promote", "demote") and destination == protected)
-        or (action in ("promote", "demote", "dismiss") and protected in current)
+        or (action in ("promote", "demote", "dismiss", "blacklist") and protected in current)
     ):
         raise ValueError("Только Начальник семьи может выдать или снять роль «Заместитель основателя».")
 
 
-def plan_roles(config, current, action, destination, department=None):
+def blacklist_days(value):
+    text = value.strip().lower()
+    if text == "бессрочно":
+        return None
+    if text.isascii() and text.isdecimal() and len(text) <= 4 and 1 <= int(text) <= 3650:
+        return int(text)
+    raise ValueError("Укажите срок от 1 до 3650 дней или «бессрочно».")
+
+
+def plan_roles(config, current, action, destination, department=None, *, managed_roles=()):
+    if config.statuses["Чёрный список"] in current and action in ("promote", "demote", "transfer", "grant"):
+        raise ValueError("Сначала вынесите участника из чёрного списка.")
     ranks = list(config.ranks.values())
     departments = {role for bundle in config.departments.values() for role in bundle}
-    statuses = set(config.statuses.values())
     shared = shared_department_roles(config.departments)
     unique_department_roles = departments - shared
     active_ranks = current & set(ranks)
-    active_departments = current & departments
     if action in ("promote", "demote"):
         if len(active_ranks) != 1:
             raise ValueError("У участника должно быть ровно одно настроенное звание.")
@@ -164,12 +183,18 @@ def plan_roles(config, current, action, destination, department=None):
         old_positions = position_roles if destination in position_roles else set()
         return ((current - unique_department_roles - old_positions)
                 | (set(config.departments[department]) - shared) | {destination})
-    if action == "dismiss":
-        if destination not in statuses:
-            raise ValueError("Этот статус увольнения не настроен.")
-        if not active_ranks and not active_departments:
-            raise ValueError("У участника нет настроенных кадровых ролей.")
-        return (current - set(ranks) - departments - statuses) | {destination}
+    if action in STATUS_ACTIONS:
+        status = config.statuses[STATUS_ACTIONS[action]]
+        if action == "unblacklist":
+            if status not in current:
+                raise ValueError("Участник не в чёрном списке.")
+            return current - {status}
+        if action == "dismiss" and config.statuses["Чёрный список"] in current:
+            raise ValueError("Участник в чёрном списке. Сначала вынесите его из списка.")
+        new = (current & set(managed_roles)) | {status}
+        if new == current:
+            raise ValueError("Этот статус уже установлен, других снимаемых ролей нет.")
+        return new
     raise ValueError("Неизвестная операция.")
 
 
@@ -214,6 +239,8 @@ async def send_personal_notice(target, actor, card, action, record):
         "demote": "📉 Твоё звание изменено",
         "transfer": "🔄 Тебя перевели в другой отдел",
         "dismiss": "🚪 Ты уволен из состава",
+        "blacklist": "⛔ Тебя внесли в чёрный список",
+        "unblacklist": "✅ Тебя вынесли из чёрного списка",
         "grant": "🎖️ Тебя назначили на должность",
     }[action]
     notice.remove_field(0)  # The recipient already knows who they are.
@@ -242,6 +269,7 @@ class AuditClient(discord.Client):
         self.config = config
         self.tree = app_commands.CommandTree(self)
         self.lock = asyncio.Lock()
+        self.expiry_task = None
         @app_commands.default_permissions(manage_guild=True)
         async def publish_command(interaction: discord.Interaction):
             await self.publish(interaction)
@@ -258,11 +286,56 @@ class AuditClient(discord.Client):
                 member INTEGER NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL,
                 old_roles TEXT NOT NULL, new_roles TEXT NOT NULL, discord_message INTEGER
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS blacklist_expiry (
+                member INTEGER PRIMARY KEY, expires INTEGER NOT NULL
+            )""")
         self.add_view(MainPanel(self))
         await self.tree.sync(guild=discord.Object(self.config.guild))
 
     async def on_ready(self):
         logging.info("ПГО КАРАТЕЛИ подключён. Сервер %s", self.config.guild)
+        if self.expiry_task is None or self.expiry_task.done():
+            self.expiry_task = asyncio.create_task(self.expire_blacklist())
+
+    async def expire_blacklist(self):
+        conf = self.config
+        while not self.is_closed():
+            try:
+                guild = self.get_guild(conf.guild)
+                if guild is not None:
+                    async with self.lock:
+                        with sqlite3.connect(conf.database) as db:
+                            due = db.execute("SELECT member FROM blacklist_expiry WHERE expires <= ?",
+                                             (int(time.time()),)).fetchall()
+                        for (member_id,) in due:
+                            await self.expire_entry(guild, member_id)
+            except Exception:
+                logging.exception("Ошибка проверки сроков ЧС")
+            await asyncio.sleep(60)
+
+    async def expire_entry(self, guild, member_id):
+        conf = self.config
+        role = guild.get_role(conf.statuses["Чёрный список"])
+        if role is None:
+            return
+        try:
+            member = await guild.fetch_member(member_id)
+            if role in member.roles:
+                await member.remove_roles(role, reason="Истёк срок чёрного списка")
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            logging.warning("Не удалось снять истёкший ЧС у %s, повторим позже", member_id)
+            return
+        with sqlite3.connect(conf.database) as db:
+            db.execute("DELETE FROM blacklist_expiry WHERE member=?", (member_id,))
+        if conf.blacklist_channel:
+            try:
+                card = embed("✅ Срок чёрного списка истёк")
+                card.add_field(name="Участник", value=f"<@{member_id}> · `{member_id}`")
+                await self.channel(guild, conf.blacklist_channel).send(embed=card)
+            except (ValueError, discord.HTTPException):
+                logging.warning("Не удалось опубликовать окончание ЧС у %s", member_id)
 
     def can_review(self, interaction, action=None):
         if interaction.guild_id != self.config.guild or not isinstance(interaction.user, discord.Member):
@@ -304,7 +377,9 @@ class AuditClient(discord.Client):
                 "Нажмите **«Подать аудит»**, чтобы открыть личное меню кадровых действий.\n\n"
                 "📈 **Повышение** и 📉 **Понижение** меняют звание, сохраняя отдел.\n"
                 "🔄 **Перевод** меняет отдел, сохраняя звание.\n"
-                "🚪 **Увольнение** снимает кадровые роли и выдаёт выбранный статус.\n\n"
+                "🚪 **Уволить** снимает обычные роли и выдаёт «Уволен».\n"
+                "⛔ **Занести в чёрный список** снимает обычные роли и выдаёт «Чёрный список».\n"
+                "✅ **Вынести из чёрного списка** снимает только эту роль.\n\n"
                 "🎖️ **Назначить на должность** — только Основатель и Заместитель основателя.\n\n"
                 "🔒 Остальные действия доступны старшему составу и Начальнику семьи. "
                 "Роль «Заместитель основателя» может выдать или снять только Начальник семьи."),
@@ -315,7 +390,7 @@ class AuditClient(discord.Client):
             await reply(interaction, str(exc) if isinstance(exc, ValueError)
                         else "Не удалось опубликовать панель. Проверьте права бота и логи.")
 
-    async def execute(self, interaction, action, member_id, destination, reason, department=None, name=None):
+    async def execute(self, interaction, action, member_id, destination, reason, department=None, name=None, days=None):
         if not self.can_review(interaction, action):
             return await reply(interaction, "У вас нет доступа к этому действию.")
         if member_id == interaction.user.id:
@@ -326,6 +401,11 @@ class AuditClient(discord.Client):
         async with self.lock:
             try:
                 channel = self.channel(guild, conf.journal)
+                if action == "blacklist" and not conf.blacklist_channel:
+                    raise ValueError("Добавьте ID специального канала в blacklist_channel_id в config.json.")
+                blacklist_channel = self.channel(guild, conf.blacklist_channel) if (
+                    conf.blacklist_channel and action in ("blacklist", "unblacklist")) else None
+                expires = int(time.time()) + days * 86400 if action == "blacklist" and days is not None else None
                 target = await guild.fetch_member(member_id)
                 actor = await guild.fetch_member(interaction.user.id)
                 if target.bot or target.id == guild.owner_id or target.top_role >= guild.me.top_role:
@@ -336,7 +416,8 @@ class AuditClient(discord.Client):
                     raise ValueError("Боту не хватает права «Управлять ролями».")
                 current = {r.id for r in target.roles if not r.is_default()}
                 require_authorization(conf, {r.id for r in actor.roles}, current, action, destination)
-                new = plan_roles(conf, current, action, destination, department)
+                new = plan_roles(conf, current, action, destination, department,
+                                 managed_roles={r.id for r in target.roles if r.managed})
                 new_nick = None
                 if action == "grant":
                     if not guild.me.guild_permissions.manage_nicknames:
@@ -371,13 +452,17 @@ class AuditClient(discord.Client):
                 "promote": ("Было звание", "Стало звание"),
                 "demote": ("Было звание", "Стало звание"),
                 "transfer": ("Прежний отдел", "Новый отдел"),
-                "dismiss": ("Снятые кадровые роли", "Итоговый статус"),
+                "dismiss": ("Снятые роли", "Итоговый статус"),
+                "blacklist": ("Снятые роли", "Итоговый статус"),
+                "unblacklist": ("Снятая роль", "Результат"),
                 "grant": ("Снятые роли", "Должность"),
             }
             previous, updated = fields[action]
             card.add_field(name=previous, value=names(before), inline=False)
-            card.add_field(name=updated, value=guild.get_role(destination).name
-                           if action in ("grant", "dismiss") else names(after), inline=False)
+            outcome = ("Исключён из чёрного списка" if action == "unblacklist" else
+                       STATUS_ACTIONS[action] if action in STATUS_ACTIONS else
+                       guild.get_role(destination).name if action == "grant" else names(after))
+            card.add_field(name=updated, value=outcome, inline=False)
             if action == "transfer":
                 old_unit = member_department(conf, current)
                 card.add_field(name="Перевод", value=f"{old_unit} → {destination}", inline=False)
@@ -386,7 +471,21 @@ class AuditClient(discord.Client):
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
                 card.add_field(name="Никнейм", value=f"{target.display_name} → {new_nick}", inline=False)
             card.add_field(name="Причина", value=reason, inline=False)
+            if action == "blacklist":
+                term = f"{days} дн. · до <t:{expires}:f>" if expires else "Бессрочно"
+                card.add_field(name="Срок", value=term, inline=False)
             record = None
+            expiry_saved = True
+            if action in ("blacklist", "unblacklist"):
+                try:
+                    with sqlite3.connect(conf.database) as db:
+                        if expires is None:
+                            db.execute("DELETE FROM blacklist_expiry WHERE member=?", (member_id,))
+                        else:
+                            db.execute("INSERT OR REPLACE INTO blacklist_expiry VALUES (?, ?)", (member_id, expires))
+                except sqlite3.Error:
+                    logging.exception("Не удалось сохранить срок ЧС")
+                    expiry_saved = False
             try:
                 with sqlite3.connect(conf.database) as db:
                     record = db.execute(
@@ -408,6 +507,13 @@ class AuditClient(discord.Client):
                         db.execute("UPDATE journal SET discord_message=? WHERE id=?", (log.id, record))
                 except sqlite3.Error:
                     logging.exception("Не сохранён ID сообщения аудита")
+            blacklist_sent = not blacklist_channel or (blacklist_channel.id == channel.id and log is not None)
+            if blacklist_channel and not blacklist_sent:
+                try:
+                    await blacklist_channel.send(embed=card)
+                    blacklist_sent = True
+                except discord.HTTPException:
+                    logging.exception("Не удалось отправить запись в канал ЧС")
             dm_sent = await send_personal_notice(target, actor, card, action, record)
             if log:
                 result = f"✅ Готово. [Запись в журнале]({log.jump_url})"
@@ -415,6 +521,10 @@ class AuditClient(discord.Client):
                 backup = f" Запись №{record} сохранена в базе." if record else " Сохранить запись в базе также не удалось."
                 result = "⚠️ Действие выполнено, но запись в канал аудита не отправилась." + backup
             result += "\n📩 Личное сообщение отправлено." if dm_sent else "\n⚠️ Не удалось отправить ЛС участнику."
+            if not blacklist_sent:
+                result += "\n⚠️ Запись в специальный канал ЧС не отправилась."
+            if not expiry_saved:
+                result += "\n⚠️ Срок ЧС не сохранён. Проверьте базу и снимите ЧС вручную при необходимости."
             await reply(interaction, result)
 
 
@@ -470,6 +580,11 @@ class MemberStep(StaffView):
     @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Выберите участника")
     async def member(self, interaction, menu):
         member = menu.values[0]
+        if self.action == "blacklist":
+            return await interaction.response.send_modal(BlacklistForm(self.bot, member.id))
+        if self.action in STATUS_ACTIONS:
+            return await interaction.response.send_modal(
+                ReasonForm(self.bot, self.action, member.id, None))
         await interaction.response.edit_message(
             content=f"Участник {member.mention}. " + (
                 "Выберите должность." if self.action == "grant" else "Выберите итоговую роль."),
@@ -482,7 +597,7 @@ class RoleStep(StaffView):
         super().__init__(bot)
         self.action = action
         conf = bot.config
-        roles = {"transfer": conf.departments, "dismiss": conf.statuses,
+        roles = {"transfer": conf.departments,
                  "grant": conf.extra_roles}.get(action, conf.ranks)
         menu = discord.ui.Select(placeholder="Выберите должность" if action == "grant" else
                                  "Выберите итоговую роль", options=[
@@ -534,6 +649,25 @@ class AppointmentForm(discord.ui.Modal, title="Назначение на дол�
             return await reply(interaction, "Укажите причину назначения.")
         await self.bot.execute(interaction, "grant", self.member_id, self.destination, reason,
                                department=self.department, name=self.name.value)
+
+
+class BlacklistForm(discord.ui.Modal, title="Занесение в чёрный список"):
+    duration = discord.ui.TextInput(label="Срок в днях или «бессрочно»", max_length=12)
+    reason = discord.ui.TextInput(label="Причина", max_length=700, style=discord.TextStyle.paragraph)
+
+    def __init__(self, bot, member_id):
+        super().__init__(timeout=300)
+        self.bot, self.member_id = bot, member_id
+
+    async def on_submit(self, interaction):
+        try:
+            days = blacklist_days(self.duration.value)
+            reason = self.reason.value.strip()
+            if not reason:
+                raise ValueError("Укажите причину.")
+        except ValueError as exc:
+            return await reply(interaction, str(exc))
+        await self.bot.execute(interaction, "blacklist", self.member_id, None, reason, days=days)
 
 
 class ReasonForm(discord.ui.Modal, title="Подтверждение кадрового действия"):
