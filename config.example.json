@@ -65,5 +65,6 @@
   "blacklist_channel_id": "",
   "appointment_roles": {},
   "position_role_sets": {},
-  "senior_department_prefixes": {}
+  "senior_department_prefixes": {},
+  "revoke_rank": ""
 }

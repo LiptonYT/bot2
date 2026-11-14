@@ -100,6 +100,7 @@ class Config:
     appointment_roles: dict = field(default_factory=dict)
     position_role_sets: dict = field(default_factory=dict)
     senior_department_prefixes: dict = field(default_factory=dict)
+    revoke_rank: int | None = None
 
     @classmethod
     def load(cls, path):
@@ -145,6 +146,13 @@ class Config:
                                                    groups[3], groups[1], protected)
         position_role_sets = load_position_role_sets(raw.get("position_role_sets", {}), groups[3], protected)
         senior_prefixes = raw.get("senior_department_prefixes", {})
+        revoke_rank_name = raw.get("revoke_rank")
+        revoke_rank = None
+        if revoke_rank_name is not None and revoke_rank_name != "":
+            if (not isinstance(revoke_rank_name, str) or revoke_rank_name not in groups[0]
+                    or revoke_rank_name == PROTECTED_RANK):
+                raise ValueError("В revoke_rank укажите название обычного звания из ranks.")
+            revoke_rank = groups[0][revoke_rank_name]
         if not isinstance(senior_prefixes, dict) or any(
             unit not in groups[1] or not isinstance(prefix, str)
             or not 1 <= len(prefix.strip()) <= 18 or "|" in prefix or not prefix.isprintable()
@@ -155,7 +163,8 @@ class Config:
                    os.getenv("KADRO_DB", "karateli_kadro.sqlite3"),
                    snowflake(raw["blacklist_channel_id"]) if raw.get("blacklist_channel_id") else None,
                    appointment_roles, position_role_sets,
-                   {unit: prefix.strip() for unit, prefix in senior_prefixes.items()})
+                   {unit: prefix.strip() for unit, prefix in senior_prefixes.items()},
+                   revoke_rank)
 
 
 REVOKE_ROLE_SET = "Снять с должности"
@@ -206,6 +215,8 @@ def require_authorization(config, actor_roles, current, action, destination):
     if action in ("grant", "revoke"):
         if not can_grant_extra(config, actor_roles):
             raise ValueError("Назначать и снимать с должности могут только Основатель и Заместитель основателя.")
+        if action == "revoke" and config.ranks[PROTECTED_RANK] in current and config.chief not in actor_roles:
+            raise ValueError("Только Начальник семьи может снять роль «Заместитель основателя».")
         return
     if not {config.senior, config.chief} & actor_roles:
         raise ValueError("У вас нет роли старшего состава или Начальника семьи.")
@@ -300,7 +311,9 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         positions = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
         if not current & positions:
             raise ValueError("У участника нет должности начальника или заместителя начальника отдела.")
-        return current - positions
+        if config.revoke_rank is None:
+            raise ValueError("Укажите звание после снятия с должности в revoke_rank в config.json.")
+        return (current - positions - {config.senior} - set(config.ranks.values())) | {config.revoke_rank}
     if action == "grant":
         if destination not in config.extra_roles.values():
             raise ValueError("Эта дополнительная роль не настроена.")
@@ -775,6 +788,7 @@ class AuditClient(discord.Client):
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
             if action == "revoke":
                 card.add_field(name="Отдел", value=revoke_unit, inline=False)
+                card.add_field(name="Итоговое звание", value=guild.get_role(conf.revoke_rank).mention, inline=False)
             if new_nick is not None:
                 card.add_field(name="Никнейм", value=f"{discord.utils.escape_markdown(old_display_name)} → "
                                f"{discord.utils.escape_markdown(new_nick)}", inline=False)
