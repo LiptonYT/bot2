@@ -7,7 +7,7 @@ import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import discord
@@ -27,6 +27,7 @@ ACTIONS = {
     "blacklist": ("⛔", "Занести в чёрный список"),
     "unblacklist": ("✅", "Вынести из чёрного списка"),
     "grant": ("🎖️", "Назначить на должность"),
+    "revoke": ("📌", "Снять с должности"),
 }
 
 
@@ -96,6 +97,7 @@ class Config:
     department_tags: dict
     database: str
     blacklist_channel: int | None = None
+    appointment_roles: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path):
@@ -136,9 +138,34 @@ class Config:
         if not isinstance(tags, dict) or any(not isinstance(tag, str) or not 1 <= len(tag.strip()) <= 10
                                              or not tag.replace(" ", "").isalnum() for tag in tags.values()):
             raise ValueError("В department_tags укажите короткие обозначения отделов без знаков.")
+        protected = {guild, senior, chief, founder, groups[0][PROTECTED_RANK], *groups[2].values()}
+        appointment_roles = load_appointment_roles(raw.get("appointment_roles", {}),
+                                                   groups[3], groups[1], protected)
         return cls(guild, panel, journal, senior, chief, founder, *groups, tags,
                    os.getenv("KADRO_DB", "karateli_kadro.sqlite3"),
-                   snowflake(raw["blacklist_channel_id"]) if raw.get("blacklist_channel_id") else None)
+                   snowflake(raw["blacklist_channel_id"]) if raw.get("blacklist_channel_id") else None,
+                   appointment_roles)
+
+
+def load_appointment_roles(raw, positions, departments, protected):
+    if not isinstance(raw, dict):
+        raise ValueError("appointment_roles должен быть объектом с названиями должностей.")
+    rules = {}
+    for position, units in raw.items():
+        if position not in positions or not isinstance(units, dict):
+            raise ValueError(f"Проверьте должность «{position}» в appointment_roles.")
+        for unit, rule in units.items():
+            if unit not in departments or not isinstance(rule, dict) or set(rule) != {"remove", "add"}:
+                raise ValueError(f"Для «{position} / {unit}» укажите отдел из departments и два списка: remove и add.")
+            if not all(isinstance(rule[key], list) for key in ("remove", "add")):
+                raise ValueError(f"Для «{position} / {unit}» remove и add должны быть списками ID.")
+            remove, add = (frozenset(snowflake(rid) for rid in rule[key]) for key in ("remove", "add"))
+            if remove & add:
+                raise ValueError(f"Для «{position} / {unit}» одна роль не может быть и в remove, и в add.")
+            if (remove | add) & protected:
+                raise ValueError(f"Для «{position} / {unit}» нельзя изменять защищённые роли через appointment_roles.")
+            rules[positions[position], unit] = (remove, add)
+    return rules
 
 
 def can_grant_extra(config, actor_roles):
@@ -146,9 +173,9 @@ def can_grant_extra(config, actor_roles):
 
 
 def require_authorization(config, actor_roles, current, action, destination):
-    if action == "grant":
+    if action in ("grant", "revoke"):
         if not can_grant_extra(config, actor_roles):
-            raise ValueError("Дополнительные роли выдают только Основатель и Заместитель основателя.")
+            raise ValueError("Назначать и снимать с должности могут только Основатель и Заместитель основателя.")
         return
     if not {config.senior, config.chief} & actor_roles:
         raise ValueError("У вас нет роли старшего состава или Начальника семьи.")
@@ -232,11 +259,20 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         if destination not in config.departments or destination == old_unit:
             raise ValueError("Выберите другой настроенный отдел.")
         return (current - unique_department_roles) | (set(config.departments[destination]) - shared)
+    if action == "revoke":
+        positions = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
+        if not current & positions:
+            raise ValueError("У участника нет должности начальника или заместителя начальника отдела.")
+        return current - positions
     if action == "grant":
         if destination not in config.extra_roles.values():
             raise ValueError("Эта дополнительная роль не настроена.")
         if department not in config.departments:
             raise ValueError("Выберите настроенный отдел.")
+        rule = config.appointment_roles.get((destination, department))
+        if rule is not None:
+            remove, add = rule
+            return (current - remove) | add
         position_roles = {role for name, role in config.extra_roles.items() if name != "Сотрудник семьи"}
         old_positions = position_roles if destination in position_roles else set()
         return ((current - unique_department_roles - old_positions)
@@ -322,6 +358,19 @@ def status_nick(config, action, label, fallback):
     return (prefix + base)[:32].rstrip()
 
 
+def revoked_nick(config, nick, fallback):
+    if not nick:
+        return None
+    leadership = {"Начальник", "Зам", "Зам. нач.", "Зам. начальника",
+                  *LEADERSHIP_PREFIXES, *LEADERSHIP_PREFIXES.values()}
+    tags = {f"{position} {department_tag(config, unit)}".casefold()
+            for position in leadership for unit in config.departments}
+    head, separator, name = nick.partition(" | ")
+    if not separator and nick.startswith("["):
+        head, separator, name = nick[1:].partition("]")
+    return (name.strip() or fallback) if separator and head.casefold() in tags else None
+
+
 def transfer_nick(config, old_unit, new_unit, label, fallback, roles):
     old_tag = re.escape(department_tag(config, old_unit))
     new_tag = department_tag(config, new_unit)
@@ -370,6 +419,7 @@ async def send_personal_notice(target, actor, card, action, record):
         "blacklist": "⛔ Тебя внесли в чёрный список",
         "unblacklist": "✅ Тебя вынесли из чёрного списка",
         "grant": "🎖️ Тебя назначили на должность",
+        "revoke": "📌 Тебя сняли с должности",
     }[action]
     notice.remove_field(0)  # The recipient already knows who they are.
     notice.set_field_at(0, name="Решение принял",
@@ -487,7 +537,7 @@ class AuditClient(discord.Client):
         actor_roles = {r.id for r in interaction.user.roles}
         standard = bool({self.config.senior, self.config.chief} & actor_roles)
         extra = can_grant_extra(self.config, actor_roles)
-        return extra if action == "grant" else (standard or extra if action is None else standard)
+        return extra if action in ("grant", "revoke") else (standard or extra if action is None else standard)
 
     def channel(self, guild, channel_id):
         channel = guild.get_channel(channel_id)
@@ -525,7 +575,7 @@ class AuditClient(discord.Client):
                 "🚪 **Уволить** снимает обычные роли и выдаёт «Уволен».\n"
                 "⛔ **Занести в чёрный список** выдаёт «Уволен» и «Чёрный список».\n"
                 "✅ **Вынести из чёрного списка** снимает ЧС и оставляет «Уволен».\n\n"
-                "🎖️ **Назначить на должность** — только Основатель и Заместитель основателя.\n\n"
+                "🎖️ **Назначить на должность** и 📌 **Снять с должности** — только Основатель и Заместитель основателя.\n\n"
                 "🔒 Остальные действия доступны старшему составу и Начальнику семьи. "
                 "Роль «Заместитель основателя» может выдать или снять только Начальник семьи."),
                 view=MainPanel(self))
@@ -569,6 +619,12 @@ class AuditClient(discord.Client):
                     new_nick = appointment_nick(conf, destination, department, name or "")
                     if new == current and new_nick == target.nick:
                         raise ValueError("Участник уже на этой должности, никнейм совпадает.")
+                elif action == "revoke":
+                    candidate = revoked_nick(conf, target.nick, target.name)
+                    if candidate is not None:
+                        if not guild.me.guild_permissions.manage_nicknames:
+                            raise ValueError("Боту не хватает права «Управлять никнеймами» для снятия приставки должности.")
+                        new_nick = candidate
                 elif action == "hire":
                     candidate = status_nick(conf, action, old_display_name, target.name)
                     if candidate != target.nick:
@@ -619,7 +675,8 @@ class AuditClient(discord.Client):
                 return "\n".join(lines) or "—"
 
             mark, label = ACTIONS[action]
-            title = {"hire": "🤝 Принят на службу", "transfer": "🔄 Переведён в другой отдел"}
+            title = {"hire": "🤝 Принят на службу", "transfer": "🔄 Переведён в другой отдел",
+                     "grant": "🎖️ Назначен на должность", "revoke": "📌 Снят с должности"}
             card = embed(title.get(action, BLACKLIST_TITLES.get(action, f"{mark} {label.upper()}")))
             card.add_field(name="Участник", value=f"{target.mention}\nID: `{target.id}`")
             card.add_field(name="Кадровик", value=f"{actor.mention}\n{discord.utils.escape_markdown(actor.display_name)}")
@@ -632,10 +689,12 @@ class AuditClient(discord.Client):
                 "blacklist": ("Снятые роли", "Итоговый статус"),
                 "unblacklist": ("Снятая роль", "Результат"),
                 "grant": ("Снятые роли", "Должность"),
+                "revoke": ("Снятые роли", "Итоговый статус"),
             }
             previous, updated = fields[action]
             card.add_field(name=previous, value=names(before), inline=False)
             outcome = ("Принят на службу · Стажёр ОЛС" if action == "hire" else
+                       "Снят с должности" if action == "revoke" else
                        f"Переведён · {department_tag(conf, destination)}" if action == "transfer" else
                        f"Исключён из чёрного списка. Роль <@&{conf.statuses['Уволен']}> остаётся." if action == "unblacklist" else
                        f"<@&{conf.statuses['Уволен']}>, <@&{conf.statuses['Чёрный список']}>" if action == "blacklist" else
@@ -774,7 +833,14 @@ class MemberStep(StaffView):
                 return await reply(interaction, str(exc))
         if self.action == "blacklist":
             return await interaction.response.send_modal(BlacklistForm(self.bot, member.id))
-        if self.action in STATUS_ACTIONS or self.action == "hire":
+        if self.action == "revoke":
+            if not isinstance(member, discord.Member) or member.bot:
+                return await reply(interaction, "Выберите участника этого сервера, а не бота.")
+            try:
+                plan_roles(self.bot.config, {role.id for role in member.roles}, "revoke", None)
+            except ValueError as exc:
+                return await reply(interaction, str(exc))
+        if self.action in STATUS_ACTIONS or self.action in ("hire", "revoke"):
             return await interaction.response.send_modal(
                 ReasonForm(self.bot, self.action, member.id, None))
         await interaction.response.edit_message(

@@ -70,5 +70,6 @@
     "Отдел координации": "ОК",
     "Оперативный отдел": "ОО"
   },
-  "blacklist_channel_id": ""
+  "blacklist_channel_id": "",
+  "appointment_roles": {}
 }
