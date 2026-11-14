@@ -186,7 +186,9 @@ def require_dismissible(config, current, base_role=None):
     if base_role is None:
         raise ValueError("Укажите ID базовой роли «Сотрудник семьи» в extra_roles в config.json.")
     if base_role not in current:
-        raise ValueError("У участника нет роли «Сотрудник семьи». Он уже считается уволенным.")
+        raise ValueError("⛔ **Увольнение недоступно**\n"
+                         "У участника нет роли **«Сотрудник семьи»**.\n"
+                         "Он уже считается уволенным.")
     return base_role
 
 
