@@ -282,7 +282,7 @@ def replace_position_roles(config, current, managed_roles, desired):
 def trainee_department_role_ids(config, guild_roles):
     configured = {role_id for bundle in config.departments.values() for role_id in bundle}
     return {role.id for role in guild_roles if role.id in configured and re.fullmatch(
-        r"[^\w]*стаж[её]р\s+подразделения", role.name.strip(), re.IGNORECASE)}
+        r"[^\w]*стаж[её]р\s+(?:подразделения|отдела)", role.name.strip(), re.IGNORECASE)}
 
 
 def plan_roles(config, current, action, destination, department=None, *, managed_roles=(), base_role=None,
@@ -318,7 +318,16 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         new = ranks.index(destination)
         if (action == "promote" and new <= old) or (action == "demote" and new >= old):
             raise ValueError("Новое звание должно соответствовать направлению операции.")
-        return (current - active_ranks) | {destination}
+        updated = (current - active_ranks) | {destination}
+        trainee_roles = set(trainee_department_roles)
+        if not trainee_roles:
+            return updated
+        trainee_ranks = {config.ranks.get(name) for name in ("Стажёр", "Стажер", "Приближённый", "Приближенный")}
+        if destination not in trainee_ranks:
+            return updated - trainee_roles
+        unit = member_department(config, current)
+        unit_trainee_roles = trainee_roles & set(config.departments[unit])
+        return (updated - trainee_roles) | unit_trainee_roles
     if action == "transfer":
         old_unit = member_department(config, current)
         if destination not in config.departments or destination == old_unit:
@@ -726,7 +735,7 @@ class AuditClient(discord.Client):
                                  managed_roles={r.id for r in target.roles if r.managed},
                                  base_role=family_role_id(conf, guild.roles) if action in ("hire", "dismiss") else None,
                                  trainee_department_roles=trainee_department_role_ids(conf, guild.roles)
-                                 if action in ("grant", "revoke") else ())
+                                 if action in ("grant", "revoke", "promote", "demote") else ())
                 new_nick = None
                 old_display_name = target.display_name
                 if action == "grant":
@@ -810,15 +819,25 @@ class AuditClient(discord.Client):
                 "revoke": ("Снятые роли", "Итоговый статус"),
             }
             previous, updated = fields[action]
-            card.add_field(name=previous, value=names(before), inline=False)
+            rank_change = action in ("promote", "demote")
+            if rank_change:
+                rank_ids = set(conf.ranks.values())
+                card.add_field(name=previous, value=names(r for r in before if r.id in rank_ids), inline=False)
+            else:
+                card.add_field(name=previous, value=names(before), inline=False)
             outcome = ("Принят на службу · Стажёр ОЛС" if action == "hire" else
                        "Снят с должности" if action == "revoke" else
                        f"Переведён · {department_tag(conf, destination)}" if action == "transfer" else
                        f"Исключён из чёрного списка. Роль <@&{conf.statuses['Уволен']}> остаётся." if action == "unblacklist" else
                        f"<@&{conf.statuses['Уволен']}>, <@&{conf.statuses['Чёрный список']}>" if action == "blacklist" else
                        f"<@&{conf.statuses[STATUS_ACTIONS[action]]}>" if action in STATUS_ACTIONS else
-                       guild.get_role(destination).mention if action == "grant" else names(after))
+                       guild.get_role(destination).mention if action in ("grant", "promote", "demote") else names(after))
             card.add_field(name=updated, value=outcome, inline=False)
+            if rank_change:
+                if any(r.id not in rank_ids for r in before):
+                    card.add_field(name="Снятые роли", value=names(r for r in before if r.id not in rank_ids), inline=False)
+                if any(r.id not in rank_ids for r in after):
+                    card.add_field(name="Выданные роли", value=names(r for r in after if r.id not in rank_ids), inline=False)
             if action == "transfer":
                 card.add_field(name="Отдел", value=f"{old_unit} → {destination}", inline=False)
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
