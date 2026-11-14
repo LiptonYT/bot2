@@ -261,25 +261,34 @@ def department_tag(config, department_name):
         word[0].upper() for word in department_name.split() if len(word) > 1)[:10] or "ОТДЕЛ"
 
 
+LEADERSHIP_PREFIXES = {
+    "Начальник отдела": "Нач",
+    "Зам. начальника отдела": "Зам.Нач",
+    "Заместитель начальника отдела": "Зам.Нач",
+}
+POSITION_TAGS = {"Начальник", "Зам", "Зам. начальника", "Зам. нач.", "Сотрудник",
+                 "Стажёр", "Стажер", *LEADERSHIP_PREFIXES.values()}
+
+
 def appointment_nick(config, destination, department, name):
     position = next((name for name, rid in config.extra_roles.items() if rid == destination), None)
     unit = department if department in config.departments else None
     if not position or not unit:
         raise ValueError("Должность или отдел не настроены.")
-    prefixes = {"Начальник отдела": "Начальник", "Зам. начальника отдела": "Зам. нач.",
-                "Сотрудник семьи": "Сотрудник"}
+    prefixes = {**LEADERSHIP_PREFIXES, "Сотрудник семьи": "Сотрудник"}
     prefix = prefixes.get(position, position)
-    nick = f"{prefix} {department_tag(config, unit)} | {' '.join(name.split())}"
-    if not name.strip() or len(nick) > 32:
+    base = clean_member_name(config, name)
+    nick = f"{prefix} {department_tag(config, unit)} | {' '.join(base.split())}"
+    if not base or len(nick) > 32:
         raise ValueError("Укажите имя короче: весь новый никнейм должен занимать не более 32 символов.")
     return nick
 
 
 def suggested_name(config, label):
     prefix, separator, name = label.partition(" | ")
-    managed = {"Начальник", "Зам. начальника", "Зам. нач.", "Сотрудник"} | set(config.extra_roles)
+    managed = POSITION_TAGS | set(config.extra_roles)
     tags = {department_tag(config, unit) for unit in config.departments}
-    return name if separator and prefix in {f"{p} {t}" for p in managed for t in tags} else label
+    return name if separator and prefix.casefold() in {f"{p} {t}".casefold() for p in managed for t in tags} else label
 
 
 STATUS_NICK_PREFIX = re.compile(r"^(?:\[(?:ЧС\s*\+\s*УВОЛЕН|ЧС|УВОЛЕН)\]\s*|"
@@ -287,11 +296,10 @@ STATUS_NICK_PREFIX = re.compile(r"^(?:\[(?:ЧС\s*\+\s*УВОЛЕН|ЧС|УВО�
                                 re.IGNORECASE)
 
 
-def status_nick(config, action, label, fallback):
+def clean_member_name(config, label):
     base = label.strip()
     tags = {department_tag(config, unit).casefold() for unit in config.departments}
-    bracket_positions = {"стажёр", "стажер", "сотрудник", "начальник",
-                         "зам. нач.", "зам. начальника"}
+    bracket_positions = {position.casefold() for position in POSITION_TAGS}
     while base:
         cleaned = suggested_name(config, STATUS_NICK_PREFIX.sub("", base, count=1)).strip()
         tag, separator, rest = cleaned.partition("]")
@@ -302,7 +310,11 @@ def status_nick(config, action, label, fallback):
         if cleaned == base:
             break
         base = cleaned
-    base = base or fallback.strip()
+    return base
+
+
+def status_nick(config, action, label, fallback):
+    base = clean_member_name(config, label) or fallback.strip()
     prefix = {
         "blacklist": "[ЧС + УВОЛЕН] ",
         "hire": f"[Стажёр {department_tag(config, HIRE_DEPARTMENT)}] ",
@@ -313,8 +325,7 @@ def status_nick(config, action, label, fallback):
 def transfer_nick(config, old_unit, new_unit, label, fallback, roles):
     old_tag = re.escape(department_tag(config, old_unit))
     new_tag = department_tag(config, new_unit)
-    positions = {"Стажёр", "Стажер", "Сотрудник", "Начальник", "Зам. нач.",
-                 "Зам. начальника", *config.extra_roles, *config.ranks}
+    positions = POSITION_TAGS | set(config.extra_roles) | set(config.ranks)
     prefixes = "|".join(re.escape(p) for p in sorted(positions, key=len, reverse=True))
     for pattern, template in (
         (rf"^\[({prefixes})\s+{old_tag}\]\s*(.*)$", "[{position} {tag}] "),
@@ -324,9 +335,8 @@ def transfer_nick(config, old_unit, new_unit, label, fallback, roles):
         if match:
             prefix = template.format(position=match[1], tag=new_tag)
             return (prefix + (match[2].strip() or fallback))[:32].rstrip()
-    position = next((short for key, short in (
-        ("Начальник отдела", "Начальник"), ("Зам. начальника отдела", "Зам. нач.")
-    ) if config.extra_roles.get(key) in roles), None)
+    position = next((short for key, short in LEADERSHIP_PREFIXES.items()
+                     if config.extra_roles.get(key) in roles), None)
     if position is None:
         trainee = config.ranks.get("Стажёр") or config.ranks.get("Стажер")
         position = "Стажёр" if trainee in roles else "Сотрудник"
@@ -771,7 +781,7 @@ class MemberStep(StaffView):
             content=f"Участник {member.mention}. " + (
                 "Выберите должность." if self.action == "grant" else "Выберите итоговую роль."),
             view=RoleStep(self.bot, self.action, member.id, {r.id for r in interaction.user.roles},
-                          suggested_name(self.bot.config, member.display_name)))
+                          clean_member_name(self.bot.config, member.display_name) or member.name))
 
 
 class RoleStep(StaffView):
