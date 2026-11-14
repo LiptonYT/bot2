@@ -71,5 +71,6 @@
     "Оперативный отдел": "ОО"
   },
   "blacklist_channel_id": "",
-  "appointment_roles": {}
+  "appointment_roles": {},
+  "position_role_sets": {}
 }

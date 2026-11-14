@@ -98,6 +98,7 @@ class Config:
     database: str
     blacklist_channel: int | None = None
     appointment_roles: dict = field(default_factory=dict)
+    position_role_sets: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path):
@@ -141,10 +142,28 @@ class Config:
         protected = {guild, senior, chief, founder, groups[0][PROTECTED_RANK], *groups[2].values()}
         appointment_roles = load_appointment_roles(raw.get("appointment_roles", {}),
                                                    groups[3], groups[1], protected)
+        position_role_sets = load_position_role_sets(raw.get("position_role_sets", {}), groups[3], protected)
         return cls(guild, panel, journal, senior, chief, founder, *groups, tags,
                    os.getenv("KADRO_DB", "karateli_kadro.sqlite3"),
                    snowflake(raw["blacklist_channel_id"]) if raw.get("blacklist_channel_id") else None,
-                   appointment_roles)
+                   appointment_roles, position_role_sets)
+
+
+REVOKE_ROLE_SET = "Снять с должности"
+
+
+def load_position_role_sets(raw, positions, protected):
+    if not isinstance(raw, dict):
+        raise ValueError("position_role_sets должен быть объектом со списками ID ролей.")
+    rules = {}
+    for name, values in raw.items():
+        if (name not in positions and name != REVOKE_ROLE_SET) or not isinstance(values, list):
+            raise ValueError(f"Проверьте название и список ID в position_role_sets: «{name}».")
+        ids = frozenset(snowflake(role) for role in values)
+        if ids & protected:
+            raise ValueError(f"В position_role_sets нельзя выдавать защищённые роли: «{name}».")
+        rules[None if name == REVOKE_ROLE_SET else positions[name]] = ids
+    return rules
 
 
 def load_appointment_roles(raw, positions, departments, protected):
@@ -221,6 +240,13 @@ def require_dismissible(config, current, base_role=None):
     return base_role
 
 
+def replace_position_roles(config, current, managed_roles, desired):
+    if current & set(config.statuses.values()):
+        raise ValueError("Нельзя менять набор ролей у участника со статусом «Уволен» или «Чёрный список».")
+    protected = {config.guild, config.senior, config.chief, config.founder, config.ranks[PROTECTED_RANK]}
+    return (current & (protected | set(managed_roles))) | desired
+
+
 def plan_roles(config, current, action, destination, department=None, *, managed_roles=(), base_role=None):
     if config.statuses["Чёрный список"] in current and action in ("hire", "promote", "demote", "transfer", "grant"):
         raise ValueError("Сначала вынесите участника из чёрного списка.")
@@ -263,12 +289,16 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         positions = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
         if not current & positions:
             raise ValueError("У участника нет должности начальника или заместителя начальника отдела.")
+        if None in config.position_role_sets:
+            return replace_position_roles(config, current, managed_roles, config.position_role_sets[None])
         return current - positions
     if action == "grant":
         if destination not in config.extra_roles.values():
             raise ValueError("Эта дополнительная роль не настроена.")
         if department not in config.departments:
             raise ValueError("Выберите настроенный отдел.")
+        if destination in config.position_role_sets:
+            return replace_position_roles(config, current, managed_roles, config.position_role_sets[destination])
         rule = config.appointment_roles.get((destination, department))
         if rule is not None:
             remove, add = rule
@@ -706,6 +736,8 @@ class AuditClient(discord.Client):
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
             if action in ("grant", "hire"):
                 card.add_field(name="Отдел", value=HIRE_DEPARTMENT if action == "hire" else department, inline=False)
+                card.add_field(name="Выданные роли", value=names(after), inline=False)
+            if action == "revoke":
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
             if new_nick is not None:
                 card.add_field(name="Никнейм", value=f"{discord.utils.escape_markdown(old_display_name)} → "
