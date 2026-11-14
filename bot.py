@@ -229,10 +229,12 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         if action == "unblacklist":
             if status not in current:
                 raise ValueError("Участник не в чёрном списке.")
-            return current - {status}
+            return (current - {status}) | {config.statuses["Уволен"]}
         remaining = (current & set(managed_roles)) | {status}
         if action == "dismiss":
             remaining.discard(require_dismissible(config, current, base_role))
+        elif action == "blacklist":
+            remaining.add(config.statuses["Уволен"])
         return remaining
     raise ValueError("Неизвестная операция.")
 
@@ -386,6 +388,12 @@ class AuditClient(discord.Client):
             member = await guild.fetch_member(member_id)
             had_blacklist = role in member.roles
             if had_blacklist:
+                dismissed = guild.get_role(conf.statuses["Уволен"])
+                if dismissed is None:
+                    logging.warning("Не найдена роль «Уволен» при снятии ЧС у %s", member_id)
+                    return
+                if dismissed not in member.roles:
+                    await member.add_roles(dismissed, reason="Истёк срок чёрного списка")
                 await member.remove_roles(role, reason="Истёк срок чёрного списка")
         except discord.NotFound:
             pass
@@ -540,7 +548,8 @@ class AuditClient(discord.Client):
             }
             previous, updated = fields[action]
             card.add_field(name=previous, value=names(before), inline=False)
-            outcome = ("Исключён из чёрного списка" if action == "unblacklist" else
+            outcome = ("Исключён из чёрного списка. Роль «Уволен» остаётся." if action == "unblacklist" else
+                       "Уволен, Чёрный список" if action == "blacklist" else
                        STATUS_ACTIONS[action] if action in STATUS_ACTIONS else
                        guild.get_role(destination).name if action == "grant" else names(after))
             card.add_field(name=updated, value=outcome, inline=False)
