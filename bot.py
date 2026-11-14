@@ -303,7 +303,10 @@ def status_nick(config, action, label, fallback):
             break
         base = cleaned
     base = base or fallback.strip()
-    prefix = "[ЧС + УВОЛЕН] " if action == "blacklist" else "[УВОЛЕН] "
+    prefix = {
+        "blacklist": "[ЧС + УВОЛЕН] ",
+        "hire": f"[Стажёр {department_tag(config, HIRE_DEPARTMENT)}] ",
+    }.get(action, "[УВОЛЕН] ")
     return (prefix + base)[:32].rstrip()
 
 
@@ -317,6 +320,14 @@ def embed(title, description=None):
 async def send_personal_notice(target, actor, card, action, record):
     """Notify only the affected member, using text rather than server mentions."""
     notice = discord.Embed.from_dict(deepcopy(card.to_dict()))
+    def role_name(match):
+        role = target.guild.get_role(int(match[1]))
+        return f"**{discord.utils.escape_markdown(role.name)}**" if role else "Роль недоступна"
+
+    for index, field in enumerate(notice.fields):
+        value = re.sub(r"<@&(\d+)>", role_name, field.value)
+        if value != field.value:
+            notice.set_field_at(index, name=field.name, value=value[:1024], inline=field.inline)
     notice.title = {
         "hire": "🤝 Тебя приняли в семью",
         "promote": "📈 Тебя повысили",
@@ -525,13 +536,12 @@ class AuditClient(discord.Client):
                     new_nick = appointment_nick(conf, destination, department, name or "")
                     if new == current and new_nick == target.nick:
                         raise ValueError("Участник уже на этой должности, никнейм совпадает.")
-                elif action == "hire" and target.nick and STATUS_NICK_PREFIX.match(target.nick):
-                    if not guild.me.guild_permissions.manage_nicknames:
-                        raise ValueError("Боту не хватает права «Управлять никнеймами», чтобы убрать отметку об увольнении.")
-                    candidate = target.nick
-                    while STATUS_NICK_PREFIX.match(candidate):
-                        candidate = STATUS_NICK_PREFIX.sub("", candidate, count=1).strip()
-                    new_nick = candidate or target.name
+                elif action == "hire":
+                    candidate = status_nick(conf, action, old_display_name, target.name)
+                    if candidate != target.nick:
+                        if not guild.me.guild_permissions.manage_nicknames:
+                            raise ValueError("Боту не хватает права «Управлять никнеймами», чтобы поставить приставку стажёра.")
+                        new_nick = candidate
                 elif action in STATUS_ACTIONS:
                     candidate = status_nick(conf, action, old_display_name, target.name)
                     if candidate != target.nick:
@@ -557,7 +567,16 @@ class AuditClient(discord.Client):
                                    else "Discord не подтвердил изменение. Проверьте роли участника и права бота.")
 
             def names(roles):
-                return ", ".join(r.name for r in roles)[:1024] or "—"
+                lines = []
+                size = 0
+                for role in roles:
+                    line = f"• {role.mention}"
+                    if size + len(line) + 1 > 1022:
+                        lines.append("…")
+                        break
+                    lines.append(line)
+                    size += len(line) + 1
+                return "\n".join(lines) or "—"
 
             mark, label = ACTIONS[action]
             card = embed(BLACKLIST_TITLES.get(action, f"{mark} {label.upper()}"))
@@ -576,10 +595,10 @@ class AuditClient(discord.Client):
             previous, updated = fields[action]
             card.add_field(name=previous, value=names(before), inline=False)
             outcome = ("Принят в семью · Стажёр ОЛС" if action == "hire" else
-                       "Исключён из чёрного списка. Роль «Уволен» остаётся." if action == "unblacklist" else
-                       "Уволен, Чёрный список" if action == "blacklist" else
-                       STATUS_ACTIONS[action] if action in STATUS_ACTIONS else
-                       guild.get_role(destination).name if action == "grant" else names(after))
+                       f"Исключён из чёрного списка. Роль <@&{conf.statuses['Уволен']}> остаётся." if action == "unblacklist" else
+                       f"<@&{conf.statuses['Уволен']}>, <@&{conf.statuses['Чёрный список']}>" if action == "blacklist" else
+                       f"<@&{conf.statuses[STATUS_ACTIONS[action]]}>" if action in STATUS_ACTIONS else
+                       guild.get_role(destination).mention if action == "grant" else names(after))
             card.add_field(name=updated, value=outcome, inline=False)
             if action == "transfer":
                 old_unit = member_department(conf, current)
@@ -618,7 +637,7 @@ class AuditClient(discord.Client):
                 logging.exception("Не удалось сохранить кадровую запись")
             log = None
             try:
-                log = await channel.send(embed=card)
+                log = await channel.send(embed=card, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 logging.exception("Роли изменены, но журнал Discord недоступен")
             if record and log:
