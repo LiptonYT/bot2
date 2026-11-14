@@ -18,6 +18,7 @@ BRAND = "💀 ПГО КАРАТЕЛИ"
 COLOR = 0x871C30
 PROTECTED_RANK = "Заместитель основателя"
 ACTIONS = {
+    "hire": ("🤝", "Принять"),
     "promote": ("📈", "Повышение"),
     "demote": ("📉", "Понижение"),
     "transfer": ("🔄", "Перевод"),
@@ -193,8 +194,15 @@ def require_dismissible(config, current, base_role=None):
 
 
 def plan_roles(config, current, action, destination, department=None, *, managed_roles=(), base_role=None):
-    if config.statuses["Чёрный список"] in current and action in ("promote", "demote", "transfer", "grant"):
+    if config.statuses["Чёрный список"] in current and action in ("hire", "promote", "demote", "transfer", "grant"):
         raise ValueError("Сначала вынесите участника из чёрного списка.")
+    if action == "hire":
+        base_role = config.extra_roles.get("Сотрудник семьи", base_role)
+        if base_role is None:
+            raise ValueError("Укажите ID базовой роли «Сотрудник семьи» в extra_roles в config.json.")
+        if base_role in current and config.statuses["Уволен"] not in current:
+            raise ValueError("Участник уже принят: у него есть роль **«Сотрудник семьи»**.")
+        return (current - {config.statuses["Уволен"]}) | {base_role}
     ranks = list(config.ranks.values())
     departments = {role for bundle in config.departments.values() for role in bundle}
     shared = shared_department_roles(config.departments)
@@ -301,6 +309,7 @@ async def send_personal_notice(target, actor, card, action, record):
     """Notify only the affected member, using text rather than server mentions."""
     notice = discord.Embed.from_dict(deepcopy(card.to_dict()))
     notice.title = {
+        "hire": "🤝 Тебя приняли в семью",
         "promote": "📈 Тебя повысили",
         "demote": "📉 Твоё звание изменено",
         "transfer": "🔄 Тебя перевели в другой отдел",
@@ -457,11 +466,12 @@ class AuditClient(discord.Client):
             message = await panel.send(embed=embed(
                 f"{BRAND} | КАДРОВЫЙ АУДИТ",
                 "Нажмите **«Подать аудит»**, чтобы открыть личное меню кадровых действий.\n\n"
+                "🤝 **Принять** выдаёт роль «Сотрудник семьи» и снимает «Уволен».\n"
                 "📈 **Повышение** и 📉 **Понижение** меняют звание, сохраняя отдел.\n"
                 "🔄 **Перевод** меняет отдел, сохраняя звание.\n"
                 "🚪 **Уволить** снимает обычные роли и выдаёт «Уволен».\n"
-                "⛔ **Занести в чёрный список** снимает обычные роли и выдаёт «Чёрный список».\n"
-                "✅ **Вынести из чёрного списка** снимает только эту роль.\n\n"
+                "⛔ **Занести в чёрный список** выдаёт «Уволен» и «Чёрный список».\n"
+                "✅ **Вынести из чёрного списка** снимает ЧС и оставляет «Уволен».\n\n"
                 "🎖️ **Назначить на должность** — только Основатель и Заместитель основателя.\n\n"
                 "🔒 Остальные действия доступны старшему составу и Начальнику семьи. "
                 "Роль «Заместитель основателя» может выдать или снять только Начальник семьи."),
@@ -497,7 +507,7 @@ class AuditClient(discord.Client):
                 require_authorization(conf, {r.id for r in actor.roles}, current, action, destination)
                 new = plan_roles(conf, current, action, destination, department,
                                  managed_roles={r.id for r in target.roles if r.managed},
-                                 base_role=family_role_id(conf, guild.roles) if action == "dismiss" else None)
+                                 base_role=family_role_id(conf, guild.roles) if action in ("hire", "dismiss") else None)
                 new_nick = None
                 old_display_name = target.display_name
                 if action == "grant":
@@ -506,6 +516,13 @@ class AuditClient(discord.Client):
                     new_nick = appointment_nick(conf, destination, department, name or "")
                     if new == current and new_nick == target.nick:
                         raise ValueError("Участник уже на этой должности, никнейм совпадает.")
+                elif action == "hire" and target.nick and STATUS_NICK_PREFIX.match(target.nick):
+                    if not guild.me.guild_permissions.manage_nicknames:
+                        raise ValueError("Боту не хватает права «Управлять никнеймами», чтобы убрать отметку об увольнении.")
+                    candidate = target.nick
+                    while STATUS_NICK_PREFIX.match(candidate):
+                        candidate = STATUS_NICK_PREFIX.sub("", candidate, count=1).strip()
+                    new_nick = candidate or target.name
                 elif action in STATUS_ACTIONS:
                     candidate = status_nick(conf, action, old_display_name, target.name)
                     if candidate != target.nick:
@@ -538,6 +555,7 @@ class AuditClient(discord.Client):
             card.add_field(name="Участник", value=f"{target.mention}\nID: `{target.id}`")
             card.add_field(name="Кадровик", value=f"{actor.mention}\n{discord.utils.escape_markdown(actor.display_name)}")
             fields = {
+                "hire": ("Снятые роли", "Итоговый статус"),
                 "promote": ("Было звание", "Стало звание"),
                 "demote": ("Было звание", "Стало звание"),
                 "transfer": ("Прежний отдел", "Новый отдел"),
@@ -548,7 +566,8 @@ class AuditClient(discord.Client):
             }
             previous, updated = fields[action]
             card.add_field(name=previous, value=names(before), inline=False)
-            outcome = ("Исключён из чёрного списка. Роль «Уволен» остаётся." if action == "unblacklist" else
+            outcome = ("Принят в семью · Сотрудник семьи" if action == "hire" else
+                       "Исключён из чёрного списка. Роль «Уволен» остаётся." if action == "unblacklist" else
                        "Уволен, Чёрный список" if action == "blacklist" else
                        STATUS_ACTIONS[action] if action in STATUS_ACTIONS else
                        guild.get_role(destination).name if action == "grant" else names(after))
@@ -674,9 +693,18 @@ class MemberStep(StaffView):
                                     family_role_id(config, interaction.guild.roles))
             except ValueError as exc:
                 return await reply(interaction, str(exc))
+        if self.action == "hire":
+            if not isinstance(member, discord.Member) or interaction.guild is None or member.bot:
+                return await reply(interaction, "Выберите участника этого сервера, а не бота.")
+            config = self.bot.config
+            try:
+                plan_roles(config, {role.id for role in member.roles}, "hire", None,
+                           base_role=family_role_id(config, interaction.guild.roles))
+            except ValueError as exc:
+                return await reply(interaction, str(exc))
         if self.action == "blacklist":
             return await interaction.response.send_modal(BlacklistForm(self.bot, member.id))
-        if self.action in STATUS_ACTIONS:
+        if self.action in STATUS_ACTIONS or self.action == "hire":
             return await interaction.response.send_modal(
                 ReasonForm(self.bot, self.action, member.id, None))
         await interaction.response.edit_message(
