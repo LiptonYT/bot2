@@ -99,6 +99,7 @@ class Config:
     blacklist_channel: int | None = None
     appointment_roles: dict = field(default_factory=dict)
     position_role_sets: dict = field(default_factory=dict)
+    senior_department_prefixes: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path):
@@ -143,10 +144,18 @@ class Config:
         appointment_roles = load_appointment_roles(raw.get("appointment_roles", {}),
                                                    groups[3], groups[1], protected)
         position_role_sets = load_position_role_sets(raw.get("position_role_sets", {}), groups[3], protected)
+        senior_prefixes = raw.get("senior_department_prefixes", {})
+        if not isinstance(senior_prefixes, dict) or any(
+            unit not in groups[1] or not isinstance(prefix, str)
+            or not 1 <= len(prefix.strip()) <= 18 or "|" in prefix or not prefix.isprintable()
+            for unit, prefix in senior_prefixes.items()
+        ):
+            raise ValueError("Проверьте названия отделов и приставки в senior_department_prefixes.")
         return cls(guild, panel, journal, senior, chief, founder, *groups, tags,
                    os.getenv("KADRO_DB", "karateli_kadro.sqlite3"),
                    snowflake(raw["blacklist_channel_id"]) if raw.get("blacklist_channel_id") else None,
-                   appointment_roles, position_role_sets)
+                   appointment_roles, position_role_sets,
+                   {unit: prefix.strip() for unit, prefix in senior_prefixes.items()})
 
 
 REVOKE_ROLE_SET = "Снять с должности"
@@ -157,12 +166,14 @@ def load_position_role_sets(raw, positions, protected):
         raise ValueError("position_role_sets должен быть объектом со списками ID ролей.")
     rules = {}
     for name, values in raw.items():
-        if (name not in positions and name != REVOKE_ROLE_SET) or not isinstance(values, list):
+        if name == REVOKE_ROLE_SET:
+            continue  # Legacy setting: revocation now only removes leadership roles.
+        if name not in positions or not isinstance(values, list):
             raise ValueError(f"Проверьте название и список ID в position_role_sets: «{name}».")
         ids = frozenset(snowflake(role) for role in values)
         if ids & protected:
             raise ValueError(f"В position_role_sets нельзя выдавать защищённые роли: «{name}».")
-        rules[None if name == REVOKE_ROLE_SET else positions[name]] = ids
+        rules[positions[name]] = ids
     return rules
 
 
@@ -289,8 +300,6 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         positions = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
         if not current & positions:
             raise ValueError("У участника нет должности начальника или заместителя начальника отдела.")
-        if None in config.position_role_sets:
-            return replace_position_roles(config, current, managed_roles, config.position_role_sets[None])
         return current - positions
     if action == "grant":
         if destination not in config.extra_roles.values():
@@ -298,7 +307,12 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         if department not in config.departments:
             raise ValueError("Выберите настроенный отдел.")
         if destination in config.position_role_sets:
-            return replace_position_roles(config, current, managed_roles, config.position_role_sets[destination])
+            # Common extras are independent of the department. Always use the
+            # selected department's markers and the selected leadership role.
+            leadership = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
+            extras = config.position_role_sets[destination] - unique_department_roles - leadership
+            desired = extras | (set(config.departments[department]) - shared) | {destination}
+            return replace_position_roles(config, current, managed_roles, desired)
         rule = config.appointment_roles.get((destination, department))
         if rule is not None:
             remove, add = rule
@@ -368,6 +382,10 @@ def clean_member_name(config, label):
     bracket_positions = {position.casefold() for position in POSITION_TAGS}
     while base:
         cleaned = suggested_name(config, STATUS_NICK_PREFIX.sub("", base, count=1)).strip()
+        head, separator, rest = cleaned.partition(" | ")
+        if separator and head.casefold() in {senior_prefix(config, unit).casefold()
+                                             for unit in config.departments} | {"ст.опер"}:
+            cleaned = rest.strip()
         tag, separator, rest = cleaned.partition("]")
         if separator and tag.startswith("["):
             position, _, unit = tag[1:].casefold().strip().rpartition(" ")
@@ -388,22 +406,36 @@ def status_nick(config, action, label, fallback):
     return (prefix + base)[:32].rstrip()
 
 
-def revoked_nick(config, nick, fallback):
-    if not nick:
-        return None
-    leadership = {"Начальник", "Зам", "Зам. нач.", "Зам. начальника",
-                  *LEADERSHIP_PREFIXES, *LEADERSHIP_PREFIXES.values()}
-    tags = {f"{position} {department_tag(config, unit)}".casefold()
-            for position in leadership for unit in config.departments}
-    head, separator, name = nick.partition(" | ")
-    if not separator and nick.startswith("["):
-        head, separator, name = nick[1:].partition("]")
-    return (name.strip() or fallback) if separator and head.casefold() in tags else None
+def senior_prefix(config, unit):
+    tag = department_tag(config, unit)
+    return config.senior_department_prefixes.get(unit) or ("Ст.Опер" if tag.casefold() == "оо" else f"Ст.{tag}")
+
+
+def revoke_department(config, roles, nick):
+    try:
+        return member_department(config, roles)
+    except ValueError:
+        head = nick.partition(" | ")[0] if " | " in nick else nick.partition("]")[0].lstrip("[")
+        positions = POSITION_TAGS | set(config.extra_roles)
+        matched = [unit for unit in config.departments if head.casefold() in {
+            f"{position} {department_tag(config, unit)}".casefold() for position in positions
+        }]
+        if len(matched) == 1:
+            return matched[0]
+        raise ValueError("Не удалось определить отдел по ролям или нику участника.")
+
+
+def revoked_nick(config, unit, nick, fallback):
+    name = clean_member_name(config, nick or fallback) or fallback
+    return f"{senior_prefix(config, unit)} | {name}"[:32].rstrip()
 
 
 def transfer_nick(config, old_unit, new_unit, label, fallback, roles):
     old_tag = re.escape(department_tag(config, old_unit))
     new_tag = department_tag(config, new_unit)
+    head, separator, personal_name = label.partition(" | ")
+    if separator and head.casefold() == senior_prefix(config, old_unit).casefold():
+        return f"{senior_prefix(config, new_unit)} | {personal_name.strip() or fallback}"[:32].rstrip()
     positions = POSITION_TAGS | set(config.extra_roles) | set(config.ranks)
     prefixes = "|".join(re.escape(p) for p in sorted(positions, key=len, reverse=True))
     for pattern, template in (
@@ -650,10 +682,11 @@ class AuditClient(discord.Client):
                     if new == current and new_nick == target.nick:
                         raise ValueError("Участник уже на этой должности, никнейм совпадает.")
                 elif action == "revoke":
-                    candidate = revoked_nick(conf, target.nick, target.name)
-                    if candidate is not None:
+                    revoke_unit = revoke_department(conf, current, old_display_name)
+                    candidate = revoked_nick(conf, revoke_unit, old_display_name, target.name)
+                    if candidate != target.nick:
                         if not guild.me.guild_permissions.manage_nicknames:
-                            raise ValueError("Боту не хватает права «Управлять никнеймами» для снятия приставки должности.")
+                            raise ValueError("Боту не хватает права «Управлять никнеймами» для смены приставки.")
                         new_nick = candidate
                 elif action == "hire":
                     candidate = status_nick(conf, action, old_display_name, target.name)
@@ -738,7 +771,7 @@ class AuditClient(discord.Client):
                 card.add_field(name="Отдел", value=HIRE_DEPARTMENT if action == "hire" else department, inline=False)
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
             if action == "revoke":
-                card.add_field(name="Выданные роли", value=names(after), inline=False)
+                card.add_field(name="Отдел", value=revoke_unit, inline=False)
             if new_nick is not None:
                 card.add_field(name="Никнейм", value=f"{discord.utils.escape_markdown(old_display_name)} → "
                                f"{discord.utils.escape_markdown(new_nick)}", inline=False)

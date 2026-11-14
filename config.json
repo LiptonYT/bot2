@@ -72,5 +72,6 @@
   },
   "blacklist_channel_id": "",
   "appointment_roles": {},
-  "position_role_sets": {}
+  "position_role_sets": {},
+  "senior_department_prefixes": {}
 }
