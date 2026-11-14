@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 BRAND = "💀 ПГО КАРАТЕЛИ"
 COLOR = 0x871C30
 PROTECTED_RANK = "Заместитель основателя"
+HIRE_DEPARTMENT = "Отдел логистики и снабжения"
 ACTIONS = {
     "hire": ("🤝", "Принять"),
     "promote": ("📈", "Повышение"),
@@ -202,7 +203,15 @@ def plan_roles(config, current, action, destination, department=None, *, managed
             raise ValueError("Укажите ID базовой роли «Сотрудник семьи» в extra_roles в config.json.")
         if base_role in current and config.statuses["Уволен"] not in current:
             raise ValueError("Участник уже принят: у него есть роль **«Сотрудник семьи»**.")
-        return (current - {config.statuses["Уволен"]}) | {base_role}
+        trainee = config.ranks.get("Стажёр") or config.ranks.get("Стажер")
+        ols_roles = set(config.departments.get(HIRE_DEPARTMENT, ()))
+        if trainee is None or len(ols_roles) < 3:
+            raise ValueError("Для приёма настройте звание «Стажёр» и три роли ОЛС в config.json.")
+        other_ranks = set(config.ranks.values()) - {trainee}
+        other_departments = {role for bundle in config.departments.values() for role in bundle} - ols_roles
+        if current & (other_ranks | other_departments):
+            raise ValueError("У участника уже есть другое звание или отдел. Используйте кадровый перевод или повышение.")
+        return (current - {config.statuses["Уволен"]}) | {base_role, trainee} | ols_roles
     ranks = list(config.ranks.values())
     departments = {role for bundle in config.departments.values() for role in bundle}
     shared = shared_department_roles(config.departments)
@@ -466,7 +475,7 @@ class AuditClient(discord.Client):
             message = await panel.send(embed=embed(
                 f"{BRAND} | КАДРОВЫЙ АУДИТ",
                 "Нажмите **«Подать аудит»**, чтобы открыть личное меню кадровых действий.\n\n"
-                "🤝 **Принять** выдаёт роль «Сотрудник семьи» и снимает «Уволен».\n"
+                "🤝 **Принять** оформляет стажёра в ОЛС и снимает «Уволен».\n"
                 "📈 **Повышение** и 📉 **Понижение** меняют звание, сохраняя отдел.\n"
                 "🔄 **Перевод** меняет отдел, сохраняя звание.\n"
                 "🚪 **Уволить** снимает обычные роли и выдаёт «Уволен».\n"
@@ -566,7 +575,7 @@ class AuditClient(discord.Client):
             }
             previous, updated = fields[action]
             card.add_field(name=previous, value=names(before), inline=False)
-            outcome = ("Принят в семью · Сотрудник семьи" if action == "hire" else
+            outcome = ("Принят в семью · Стажёр ОЛС" if action == "hire" else
                        "Исключён из чёрного списка. Роль «Уволен» остаётся." if action == "unblacklist" else
                        "Уволен, Чёрный список" if action == "blacklist" else
                        STATUS_ACTIONS[action] if action in STATUS_ACTIONS else
@@ -575,8 +584,8 @@ class AuditClient(discord.Client):
             if action == "transfer":
                 old_unit = member_department(conf, current)
                 card.add_field(name="Перевод", value=f"{old_unit} → {destination}", inline=False)
-            if action == "grant":
-                card.add_field(name="Отдел", value=department, inline=False)
+            if action in ("grant", "hire"):
+                card.add_field(name="Отдел", value=HIRE_DEPARTMENT if action == "hire" else department, inline=False)
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
             if new_nick is not None:
                 card.add_field(name="Никнейм", value=f"{discord.utils.escape_markdown(old_display_name)} → "
