@@ -310,6 +310,29 @@ def status_nick(config, action, label, fallback):
     return (prefix + base)[:32].rstrip()
 
 
+def transfer_nick(config, old_unit, new_unit, label, fallback, roles):
+    old_tag = re.escape(department_tag(config, old_unit))
+    new_tag = department_tag(config, new_unit)
+    positions = {"Стажёр", "Стажер", "Сотрудник", "Начальник", "Зам. нач.",
+                 "Зам. начальника", *config.extra_roles, *config.ranks}
+    prefixes = "|".join(re.escape(p) for p in sorted(positions, key=len, reverse=True))
+    for pattern, template in (
+        (rf"^\[({prefixes})\s+{old_tag}\]\s*(.*)$", "[{position} {tag}] "),
+        (rf"^({prefixes})\s+{old_tag}\s*\|\s*(.*)$", "{position} {tag} | "),
+    ):
+        match = re.match(pattern, label.strip(), re.IGNORECASE)
+        if match:
+            prefix = template.format(position=match[1], tag=new_tag)
+            return (prefix + (match[2].strip() or fallback))[:32].rstrip()
+    position = next((short for key, short in (
+        ("Начальник отдела", "Начальник"), ("Зам. начальника отдела", "Зам. нач.")
+    ) if config.extra_roles.get(key) in roles), None)
+    if position is None:
+        trainee = config.ranks.get("Стажёр") or config.ranks.get("Стажер")
+        position = "Стажёр" if trainee in roles else "Сотрудник"
+    return (f"[{position} {new_tag}] " + (label.strip() or fallback))[:32].rstrip()
+
+
 def embed(title, description=None):
     card = discord.Embed(title=title, description=description, color=COLOR,
                          timestamp=discord.utils.utcnow())
@@ -329,7 +352,7 @@ async def send_personal_notice(target, actor, card, action, record):
         if value != field.value:
             notice.set_field_at(index, name=field.name, value=value[:1024], inline=field.inline)
     notice.title = {
-        "hire": "🤝 Тебя приняли в семью",
+        "hire": "🤝 Тебя приняли на службу",
         "promote": "📈 Тебя повысили",
         "demote": "📉 Твоё звание изменено",
         "transfer": "🔄 Тебя перевели в другой отдел",
@@ -542,6 +565,13 @@ class AuditClient(discord.Client):
                         if not guild.me.guild_permissions.manage_nicknames:
                             raise ValueError("Боту не хватает права «Управлять никнеймами», чтобы поставить приставку стажёра.")
                         new_nick = candidate
+                elif action == "transfer":
+                    old_unit = member_department(conf, current)
+                    candidate = transfer_nick(conf, old_unit, destination, old_display_name, target.name, current)
+                    if candidate != target.nick:
+                        if not guild.me.guild_permissions.manage_nicknames:
+                            raise ValueError("Боту не хватает права «Управлять никнеймами» для перевода.")
+                        new_nick = candidate
                 elif action in STATUS_ACTIONS:
                     candidate = status_nick(conf, action, old_display_name, target.name)
                     if candidate != target.nick:
@@ -579,14 +609,15 @@ class AuditClient(discord.Client):
                 return "\n".join(lines) or "—"
 
             mark, label = ACTIONS[action]
-            card = embed(BLACKLIST_TITLES.get(action, f"{mark} {label.upper()}"))
+            title = {"hire": "🤝 Принят на службу", "transfer": "🔄 Переведён в другой отдел"}
+            card = embed(title.get(action, BLACKLIST_TITLES.get(action, f"{mark} {label.upper()}")))
             card.add_field(name="Участник", value=f"{target.mention}\nID: `{target.id}`")
             card.add_field(name="Кадровик", value=f"{actor.mention}\n{discord.utils.escape_markdown(actor.display_name)}")
             fields = {
                 "hire": ("Снятые роли", "Итоговый статус"),
                 "promote": ("Было звание", "Стало звание"),
                 "demote": ("Было звание", "Стало звание"),
-                "transfer": ("Прежний отдел", "Новый отдел"),
+                "transfer": ("Снятые роли", "Итоговый статус"),
                 "dismiss": ("Снятые роли", "Итоговый статус"),
                 "blacklist": ("Снятые роли", "Итоговый статус"),
                 "unblacklist": ("Снятая роль", "Результат"),
@@ -594,15 +625,16 @@ class AuditClient(discord.Client):
             }
             previous, updated = fields[action]
             card.add_field(name=previous, value=names(before), inline=False)
-            outcome = ("Принят в семью · Стажёр ОЛС" if action == "hire" else
+            outcome = ("Принят на службу · Стажёр ОЛС" if action == "hire" else
+                       f"Переведён · {department_tag(conf, destination)}" if action == "transfer" else
                        f"Исключён из чёрного списка. Роль <@&{conf.statuses['Уволен']}> остаётся." if action == "unblacklist" else
                        f"<@&{conf.statuses['Уволен']}>, <@&{conf.statuses['Чёрный список']}>" if action == "blacklist" else
                        f"<@&{conf.statuses[STATUS_ACTIONS[action]]}>" if action in STATUS_ACTIONS else
                        guild.get_role(destination).mention if action == "grant" else names(after))
             card.add_field(name=updated, value=outcome, inline=False)
             if action == "transfer":
-                old_unit = member_department(conf, current)
-                card.add_field(name="Перевод", value=f"{old_unit} → {destination}", inline=False)
+                card.add_field(name="Отдел", value=f"{old_unit} → {destination}", inline=False)
+                card.add_field(name="Выданные роли", value=names(after), inline=False)
             if action in ("grant", "hire"):
                 card.add_field(name="Отдел", value=HIRE_DEPARTMENT if action == "hire" else department, inline=False)
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
