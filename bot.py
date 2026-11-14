@@ -304,23 +304,25 @@ def plan_roles(config, current, action, destination, department=None, *, managed
     if action == "grant":
         if destination not in config.extra_roles.values():
             raise ValueError("Эта дополнительная роль не настроена.")
-        if department not in config.departments:
-            raise ValueError("Выберите настроенный отдел.")
+        try:
+            current_department = member_department(config, current)
+        except ValueError:
+            raise ValueError("Для назначения у участника должна быть роль ровно одного отдела.") from None
+        if department is not None and department != current_department:
+            raise ValueError("Назначение не меняет отдел. Сначала оформите перевод.")
+        department = current_department
         if destination in config.position_role_sets:
-            # Common extras are independent of the department. Always use the
-            # selected department's markers and the selected leadership role.
             leadership = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
             extras = config.position_role_sets[destination] - unique_department_roles - leadership
-            desired = extras | (set(config.departments[department]) - shared) | {destination}
+            desired = extras | (current & departments) | {destination}
             return replace_position_roles(config, current, managed_roles, desired)
         rule = config.appointment_roles.get((destination, department))
         if rule is not None:
             remove, add = rule
-            return (current - remove) | add
+            return (current - (remove - departments)) | (add - unique_department_roles)
         position_roles = {role for name, role in config.extra_roles.items() if name != "Сотрудник семьи"}
         old_positions = position_roles if destination in position_roles else set()
-        return ((current - unique_department_roles - old_positions)
-                | (set(config.departments[department]) - shared) | {destination})
+        return (current - old_positions) | {destination}
     if action in STATUS_ACTIONS:
         status = config.statuses[STATUS_ACTIONS[action]]
         if action == "unblacklist":
@@ -676,6 +678,7 @@ class AuditClient(discord.Client):
                 new_nick = None
                 old_display_name = target.display_name
                 if action == "grant":
+                    department = member_department(conf, current)
                     if not guild.me.guild_permissions.manage_nicknames:
                         raise ValueError("Боту не хватает права «Управлять никнеймами».")
                     new_nick = appointment_nick(conf, destination, department, name or "")
@@ -932,25 +935,9 @@ class RoleStep(StaffView):
         async def callback(interaction):
             destination = menu.values[0] if action == "transfer" else int(menu.values[0])
             if action == "grant":
-                position = next(label for label, rid in conf.extra_roles.items() if rid == destination)
-                return await interaction.response.edit_message(
-                    content=f"Должность **{position}**. Выберите отдел.",
-                    view=DepartmentStep(bot, member_id, destination, name))
+                return await interaction.response.send_modal(
+                    AppointmentForm(bot, member_id, destination, None, name))
             await interaction.response.send_modal(ReasonForm(bot, action, member_id, destination))
-        menu.callback = callback
-        self.add_item(menu)
-
-
-class DepartmentStep(StaffView):
-    def __init__(self, bot, member_id, destination, name):
-        super().__init__(bot)
-        self.action = "grant"
-        menu = discord.ui.Select(placeholder="Выберите отдел", options=[
-            discord.SelectOption(label=label, value=label)
-            for label in bot.config.departments])
-        async def callback(interaction):
-            await interaction.response.send_modal(
-                AppointmentForm(bot, member_id, destination, menu.values[0], name))
         menu.callback = callback
         self.add_item(menu)
 
