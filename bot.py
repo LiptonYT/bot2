@@ -271,7 +271,14 @@ def replace_position_roles(config, current, managed_roles, desired):
     return (current & (protected | set(managed_roles))) | desired
 
 
-def plan_roles(config, current, action, destination, department=None, *, managed_roles=(), base_role=None):
+def trainee_department_role_ids(config, guild_roles):
+    configured = {role_id for bundle in config.departments.values() for role_id in bundle}
+    return {role.id for role in guild_roles if role.id in configured and re.fullmatch(
+        r"[^\w]*стаж[её]р\s+подразделения", role.name.strip(), re.IGNORECASE)}
+
+
+def plan_roles(config, current, action, destination, department=None, *, managed_roles=(), base_role=None,
+               trainee_department_roles=()):
     if config.statuses["Чёрный список"] in current and action in ("hire", "promote", "demote", "transfer", "grant"):
         raise ValueError("Сначала вынесите участника из чёрного списка.")
     if action == "hire":
@@ -315,7 +322,8 @@ def plan_roles(config, current, action, destination, department=None, *, managed
             raise ValueError("У участника нет должности начальника или заместителя начальника отдела.")
         if config.revoke_rank is None:
             raise ValueError("Укажите звание после снятия с должности в revoke_rank в config.json.")
-        return (current - positions - {config.senior} - set(config.ranks.values())) | {config.revoke_rank}
+        return (current - positions - {config.senior} - set(config.ranks.values())
+                - set(trainee_department_roles)) | {config.revoke_rank}
     if action == "grant":
         if destination not in config.extra_roles.values():
             raise ValueError("Эта дополнительная роль не настроена.")
@@ -328,17 +336,31 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         department = current_department
         leadership = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
         automatic = {config.senior} if destination in leadership else set()
+        def finish(roles):
+            roles |= automatic
+            if destination not in leadership:
+                return roles
+            roles -= set(trainee_department_roles)
+            if not active_ranks:
+                return roles
+            old_index = max(ranks.index(role) for role in active_ranks)
+            next_index = old_index + 1
+            rank = ranks[old_index]
+            if not current & leadership and next_index < len(ranks) and ranks[next_index] != config.ranks[PROTECTED_RANK]:
+                rank = ranks[next_index]
+            return (roles - set(ranks)) | {rank}
+
         if destination in config.position_role_sets:
             extras = config.position_role_sets[destination] - unique_department_roles - leadership
             desired = extras | (current & departments) | {destination}
-            return replace_position_roles(config, current, managed_roles, desired) | automatic
+            return finish(replace_position_roles(config, current, managed_roles, desired))
         rule = config.appointment_roles.get((destination, department))
         if rule is not None:
             remove, add = rule
-            return (current - (remove - departments)) | (add - unique_department_roles) | automatic
+            return finish((current - (remove - departments)) | (add - unique_department_roles))
         position_roles = {role for name, role in config.extra_roles.items() if name != "Сотрудник семьи"}
         old_positions = position_roles if destination in position_roles else set()
-        return (current - old_positions) | {destination} | automatic
+        return finish((current - old_positions) | {destination})
     if action in STATUS_ACTIONS:
         status = config.statuses[STATUS_ACTIONS[action]]
         if action == "unblacklist":
@@ -690,7 +712,9 @@ class AuditClient(discord.Client):
                 require_authorization(conf, {r.id for r in actor.roles}, current, action, destination)
                 new = plan_roles(conf, current, action, destination, department,
                                  managed_roles={r.id for r in target.roles if r.managed},
-                                 base_role=family_role_id(conf, guild.roles) if action in ("hire", "dismiss") else None)
+                                 base_role=family_role_id(conf, guild.roles) if action in ("hire", "dismiss") else None,
+                                 trainee_department_roles=trainee_department_role_ids(conf, guild.roles)
+                                 if action in ("grant", "revoke") else ())
                 new_nick = None
                 old_display_name = target.display_name
                 if action == "grant":
