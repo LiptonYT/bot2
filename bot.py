@@ -101,6 +101,7 @@ class Config:
     position_role_sets: dict = field(default_factory=dict)
     senior_department_prefixes: dict = field(default_factory=dict)
     revoke_rank: int | None = None
+    department_head_rank: int | None = None
 
     @classmethod
     def load(cls, path):
@@ -153,6 +154,13 @@ class Config:
                     or revoke_rank_name == PROTECTED_RANK):
                 raise ValueError("В revoke_rank укажите название обычного звания из ranks.")
             revoke_rank = groups[0][revoke_rank_name]
+        head_rank_name = raw.get("department_head_rank")
+        department_head_rank = None
+        if head_rank_name is not None and head_rank_name != "":
+            if (not isinstance(head_rank_name, str) or head_rank_name not in groups[0]
+                    or head_rank_name == PROTECTED_RANK):
+                raise ValueError("В department_head_rank укажите название обычного звания из ranks.")
+            department_head_rank = groups[0][head_rank_name]
         if not isinstance(senior_prefixes, dict) or any(
             unit not in groups[1] or not isinstance(prefix, str)
             or not 1 <= len(prefix.strip()) <= 18 or "|" in prefix or not prefix.isprintable()
@@ -164,7 +172,7 @@ class Config:
                    snowflake(raw["blacklist_channel_id"]) if raw.get("blacklist_channel_id") else None,
                    appointment_roles, position_role_sets,
                    {unit: prefix.strip() for unit, prefix in senior_prefixes.items()},
-                   revoke_rank)
+                   revoke_rank, department_head_rank)
 
 
 REVOKE_ROLE_SET = "Снять с должности"
@@ -341,6 +349,10 @@ def plan_roles(config, current, action, destination, department=None, *, managed
             if destination not in leadership:
                 return roles
             roles -= set(trainee_department_roles)
+            if destination == config.extra_roles.get("Начальник отдела") and config.department_head_rank is not None:
+                if config.ranks[PROTECTED_RANK] in current:
+                    raise ValueError("Сначала отдельно снимите защищённое звание «Заместитель основателя».")
+                return (roles - set(ranks)) | {config.department_head_rank}
             if not active_ranks:
                 return roles
             old_index = max(ranks.index(role) for role in active_ranks)
@@ -813,6 +825,9 @@ class AuditClient(discord.Client):
             if action in ("grant", "hire"):
                 card.add_field(name="Отдел", value=HIRE_DEPARTMENT if action == "hire" else department, inline=False)
                 card.add_field(name="Выданные роли", value=names(after), inline=False)
+            if (action == "grant" and destination == conf.extra_roles.get("Начальник отдела")
+                    and conf.department_head_rank is not None):
+                card.add_field(name="Итоговое звание", value=f"<@&{conf.department_head_rank}>", inline=False)
             if action == "revoke":
                 card.add_field(name="Отдел", value=revoke_unit, inline=False)
                 card.add_field(name="Итоговое звание", value=guild.get_role(conf.revoke_rank).mention, inline=False)

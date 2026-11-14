@@ -74,5 +74,6 @@
   "appointment_roles": {},
   "position_role_sets": {},
   "senior_department_prefixes": {},
-  "revoke_rank": ""
+  "revoke_rank": "",
+  "department_head_rank": ""
 }
