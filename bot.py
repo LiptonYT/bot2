@@ -144,7 +144,7 @@ class Config:
         protected = {guild, senior, chief, founder, groups[0][PROTECTED_RANK], *groups[2].values()}
         appointment_roles = load_appointment_roles(raw.get("appointment_roles", {}),
                                                    groups[3], groups[1], protected)
-        position_role_sets = load_position_role_sets(raw.get("position_role_sets", {}), groups[3], protected)
+        position_role_sets = load_position_role_sets(raw.get("position_role_sets", {}), groups[3], protected, senior)
         senior_prefixes = raw.get("senior_department_prefixes", {})
         revoke_rank_name = raw.get("revoke_rank")
         revoke_rank = None
@@ -170,7 +170,7 @@ class Config:
 REVOKE_ROLE_SET = "Снять с должности"
 
 
-def load_position_role_sets(raw, positions, protected):
+def load_position_role_sets(raw, positions, protected, senior):
     if not isinstance(raw, dict):
         raise ValueError("position_role_sets должен быть объектом со списками ID ролей.")
     rules = {}
@@ -180,6 +180,8 @@ def load_position_role_sets(raw, positions, protected):
         if name not in positions or not isinstance(values, list):
             raise ValueError(f"Проверьте название и список ID в position_role_sets: «{name}».")
         ids = frozenset(snowflake(role) for role in values)
+        if name in LEADERSHIP_PREFIXES:
+            ids = ids - {senior}  # Already granted automatically for leadership appointments.
         if ids & protected:
             raise ValueError(f"В position_role_sets нельзя выдавать защищённые роли: «{name}».")
         rules[positions[name]] = ids
@@ -324,18 +326,19 @@ def plan_roles(config, current, action, destination, department=None, *, managed
         if department is not None and department != current_department:
             raise ValueError("Назначение не меняет отдел. Сначала оформите перевод.")
         department = current_department
+        leadership = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
+        automatic = {config.senior} if destination in leadership else set()
         if destination in config.position_role_sets:
-            leadership = {config.extra_roles[key] for key in LEADERSHIP_PREFIXES if key in config.extra_roles}
             extras = config.position_role_sets[destination] - unique_department_roles - leadership
             desired = extras | (current & departments) | {destination}
-            return replace_position_roles(config, current, managed_roles, desired)
+            return replace_position_roles(config, current, managed_roles, desired) | automatic
         rule = config.appointment_roles.get((destination, department))
         if rule is not None:
             remove, add = rule
-            return (current - (remove - departments)) | (add - unique_department_roles)
+            return (current - (remove - departments)) | (add - unique_department_roles) | automatic
         position_roles = {role for name, role in config.extra_roles.items() if name != "Сотрудник семьи"}
         old_positions = position_roles if destination in position_roles else set()
-        return (current - old_positions) | {destination}
+        return (current - old_positions) | {destination} | automatic
     if action in STATUS_ACTIONS:
         status = config.statuses[STATUS_ACTIONS[action]]
         if action == "unblacklist":
